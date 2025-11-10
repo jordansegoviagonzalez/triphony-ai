@@ -35,7 +35,7 @@ def create_app() -> FastAPI:
     @app.middleware("http")
     async def security_middleware(request: Request, call_next):
         content_length = request.headers.get("content-length")
-        if content_length and int(content_length) > 2 * 1024 * 1024:
+        if content_length and int(content_length) > settings.max_request_body_bytes:
             return JSONResponse(status_code=413, content={"detail": "request body too large"})
         request.state.correlation_id = request.headers.get("X-Correlation-ID") or __import__("uuid").uuid4().hex
         correlation_token = set_correlation_id(request.state.correlation_id)
@@ -61,7 +61,13 @@ def create_app() -> FastAPI:
 
     @app.get("/api/v1/ready")
     def readiness() -> dict:
-        checks: dict[str, str] = {"storage": "configured", "provider_live_verification": "not_performed"}
+        storage_errors = settings.storage_configuration_errors()
+        provider_errors = settings.provider_configuration_errors()
+        checks: dict[str, str] = {
+            "storage": "ok" if not storage_errors else "unavailable",
+            "provider_live_verification": "not_performed",
+            "provider_configuration": "ok" if not provider_errors else "unavailable",
+        }
         try:
             with engine.connect() as connection:
                 connection.execute(text("SELECT 1"))
@@ -73,8 +79,7 @@ def create_app() -> FastAPI:
             checks["redis"] = "ok"
         except Exception:
             checks["redis"] = "unavailable"
-        ready = all(checks[key] == "ok" for key in ("database", "redis"))
-        checks["provider_configuration"] = "fake_mode" if settings.provider_mode in {"fake", "mock"} else "configured"
+        ready = all(checks[key] == "ok" for key in ("database", "redis", "storage", "provider_configuration"))
         return {"status": "ready" if ready else "not_ready", "checks": checks}
 
     return app

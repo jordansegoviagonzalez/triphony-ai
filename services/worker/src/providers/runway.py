@@ -171,11 +171,27 @@ class RunwayVisualAgent(VisualAgent):
             if result.asset is not None:
                 return VisualAgentResult(job=job, asset=result.asset)
             if job.status is ProviderJobStatus.failed:
-                raise ProviderError(ProviderErrorKind.terminal, "Runway generation failed")
+                raise ProviderError(
+                    ProviderErrorKind.terminal,
+                    "Runway generation failed",
+                    provider_name=self.capabilities.provider_name,
+                    provider_job_id=job.provider_job_id,
+                )
             if job.status is ProviderJobStatus.cancelled:
-                raise ProviderError(ProviderErrorKind.terminal, "Runway generation was cancelled")
+                raise ProviderError(
+                    ProviderErrorKind.terminal,
+                    "Runway generation was cancelled",
+                    provider_name=self.capabilities.provider_name,
+                    provider_job_id=job.provider_job_id,
+                )
             if self._clock() >= deadline:
-                raise ProviderError(ProviderErrorKind.timeout, "Runway task polling timed out", retryable=True)
+                raise ProviderError(
+                    ProviderErrorKind.timeout,
+                    "Runway task polling timed out",
+                    provider_name=self.capabilities.provider_name,
+                    provider_job_id=job.provider_job_id,
+                    retryable=True,
+                )
             self._sleep(self.config.runway_poll_interval_seconds)
 
     def cancel(self, job_id: str) -> None:

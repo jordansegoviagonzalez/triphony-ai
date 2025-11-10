@@ -44,6 +44,7 @@ class Settings(BaseSettings):
     s3_presigned_url_expiration: int = 300
     s3_multipart_threshold_bytes: int = 64 * 1024 * 1024
     max_artifact_bytes: int = 512 * 1024 * 1024
+    max_request_body_bytes: int = 2 * 1024 * 1024
     csrf_cookie_name: str = "triphony_csrf"
     csrf_header_name: str = "X-CSRF-Token"
     trusted_hosts: str = "localhost,127.0.0.1"
@@ -78,6 +79,40 @@ class Settings(BaseSettings):
         if self.provider_mode == "real" and not self.auth_cookie_secure:
             raise ValueError("AUTH_COOKIE_SECURE must be true when PROVIDER_MODE=real")
         return self
+
+    def provider_configuration_errors(self) -> list[str]:
+        if self.provider_mode in {"fake", "mock"}:
+            return []
+        errors: list[str] = []
+        if not self.google_cloud_project:
+            errors.append("GOOGLE_CLOUD_PROJECT is required")
+        if not self.google_cloud_location:
+            errors.append("GOOGLE_CLOUD_LOCATION is required")
+        if not self.google_genai_use_vertexai:
+            errors.append("GOOGLE_GENAI_USE_VERTEXAI must be true")
+        if not self.veo_output_gcs_uri or not self.veo_output_gcs_uri.startswith("gs://"):
+            errors.append("VEO_OUTPUT_GCS_URI must be a gs:// URI")
+        if not self.elevenlabs_api_key or self.elevenlabs_api_key.strip().lower().startswith(("your-", "your_", "<", "{")):
+            errors.append("ELEVENLABS_API_KEY is missing or a placeholder")
+        if not self.elevenlabs_voice_id or self.elevenlabs_voice_id.strip().lower().startswith(("your-", "your_", "<", "{")):
+            errors.append("ELEVENLABS_VOICE_ID is missing or a placeholder")
+        if self.runway_fallback_enabled and (not self.runway_api_secret or self.runway_api_secret.strip().lower().startswith(("your-", "your_", "<", "{"))):
+            errors.append("RUNWAY_API_SECRET is missing or a placeholder")
+        return errors
+
+    def storage_configuration_errors(self) -> list[str]:
+        if self.artifact_storage_backend == "local":
+            return []
+        errors: list[str] = []
+        if not self.s3_bucket:
+            errors.append("S3_BUCKET is required")
+        if self.s3_server_side_encryption == "aws:kms" and not self.s3_kms_key_id:
+            errors.append("S3_KMS_KEY_ID is required for aws:kms")
+        if not 1 <= self.s3_presigned_url_expiration <= 3600:
+            errors.append("S3_PRESIGNED_URL_EXPIRATION must be between 1 and 3600")
+        if self.s3_multipart_threshold_bytes <= 0 or self.max_artifact_bytes <= 0:
+            errors.append("artifact size limits must be positive")
+        return errors
 
     @property
     def allowed_origins(self) -> set[str]:

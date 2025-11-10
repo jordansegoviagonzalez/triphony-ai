@@ -184,6 +184,12 @@ def create_scene(
         raise HTTPException(status_code=429, detail={"code": reason, "message": "Generation limit reached"}, headers=headers)
 
     scene_id = str(uuid.uuid4())
+    governance = RedisGovernance()
+    try:
+        governance.bind_reservation(current_user.id, scene_id)
+    except RuntimeError as error:
+        governance.release_concurrent(current_user.id)
+        raise HTTPException(status_code=503, detail={"code": "governance_unavailable", "message": "Usage controls are temporarily unavailable"}) from error
     # Link the scene to the authenticated user
     scene = Scene(id=scene_id, prompt=payload.prompt, status=SceneStatus.queued, user_id=current_user.id)
 
@@ -231,6 +237,7 @@ def cancel_scene(scene_id: str, db: Session = Depends(get_db), current_user: Use
     scene.workflow_error = {"code": "workflow_cancelled", "message": "Cancelled by the scene owner"}
     record_audit(db, actor_user_id=current_user.id, event_type="workflow_cancellation", resource_type="scene", resource_id=scene_id, correlation=correlation_id(), outcome="success")
     db.commit()
+    RedisGovernance().release_concurrent(current_user.id, scene_id)
     try:
         from shared.celery_app import celery_app
         celery_app.control.revoke(f"scene:{scene_id}:start", terminate=False)

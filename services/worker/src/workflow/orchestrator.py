@@ -91,6 +91,11 @@ def _transition(scene: Scene, next_state: WorkflowStateRecord) -> None:
 
 
 def _fail(db, scene: Scene, message: str, code: str = "workflow_failed") -> None:
+    was_terminal = scene.workflow_state in {
+        WorkflowStateRecord.failed,
+        WorkflowStateRecord.cancelled,
+        WorkflowStateRecord.completed,
+    }
     scene.workflow_error = {"code": code, "message": message[:500]}
     scene.status = SceneStatus.failed
     scene.workflow_state = WorkflowStateRecord.failed
@@ -105,7 +110,8 @@ def _fail(db, scene: Scene, message: str, code: str = "workflow_failed") -> None
         metadata={"code": code},
     )
     db.commit()
-    RedisGovernance().release_concurrent(scene.user_id)
+    if not was_terminal:
+        RedisGovernance().release_concurrent(scene.user_id, scene.id)
     metric_inc("triphony.workflow.failures", code=code)
 
 
@@ -154,6 +160,32 @@ def _plan_from_record(record: ScenePlanRecord) -> ScenePlan:
 
 
 def _persist_job(db, job, idempotency_key: str) -> ProviderJobRecord:
+    def attempt_status(value: str) -> ProviderJobAttemptRecordStatus:
+        if value == "succeeded":
+            return ProviderJobAttemptRecordStatus.succeeded
+        if value == "failed":
+            return ProviderJobAttemptRecordStatus.failed
+        if value == "cancelled":
+            return ProviderJobAttemptRecordStatus.cancelled
+        return ProviderJobAttemptRecordStatus.started
+
+    def add_attempt(record: ProviderJobRecord, *, previous_attempt_id: int | None = None, provider_name: str | None = None, provider_job_identifier: str | None = None, status: ProviderJobAttemptRecordStatus | None = None, failure: dict[str, Any] | None = None, failure_classification: str | None = None, fallback_reason: str | None = None) -> ProviderJobAttemptRecord:
+        attempt = ProviderJobAttemptRecord(
+            provider_job_id=record.id,
+            attempt_number=max((item.attempt_number for item in record.attempts), default=0) + 1,
+            status=status or attempt_status(job.status.value),
+            provider_job_identifier=provider_job_identifier if provider_job_identifier is not None else job.provider_job_id,
+            provider_name=provider_name or job.provenance.provider,
+            failure_classification=failure_classification or (job.failure.code if job.failure else None),
+            fallback_reason=fallback_reason,
+            previous_attempt_id=previous_attempt_id,
+            failure=failure or (job.failure.model_dump(mode="json") if job.failure else None),
+            completed_at=datetime.now(timezone.utc).replace(tzinfo=None) if (status or attempt_status(job.status.value)) in {ProviderJobAttemptRecordStatus.succeeded, ProviderJobAttemptRecordStatus.failed, ProviderJobAttemptRecordStatus.cancelled} else None,
+        )
+        db.add(attempt)
+        db.flush()
+        return attempt
+
     record = db.query(ProviderJobRecord).filter(ProviderJobRecord.idempotency_key == idempotency_key).first()
     if record is None:
         record = ProviderJobRecord(
@@ -167,32 +199,52 @@ def _persist_job(db, job, idempotency_key: str) -> ProviderJobRecord:
             model_version=job.provenance.model_version or job.provenance.model,
             provider_job_id=job.provider_job_id,
             provenance=job.provenance.model_dump(mode="json"),
+            failure=job.failure.model_dump(mode="json") if job.failure else None,
         )
         db.add(record)
         db.flush()
-        db.add(ProviderJobAttemptRecord(
-            provider_job_id=record.id,
-            attempt_number=1,
-            status=ProviderJobAttemptRecordStatus.succeeded if job.status.value == "succeeded" else ProviderJobAttemptRecordStatus.started,
-            provider_job_identifier=job.provider_job_id,
-            completed_at=datetime.now(timezone.utc).replace(tzinfo=None) if job.status.value == "succeeded" else None,
-        ))
+        metadata = job.provenance.metadata
+        previous_provider = metadata.get("previous_provider") or metadata.get("fallback_from")
+        if previous_provider:
+            previous = add_attempt(
+                record,
+                provider_name=str(previous_provider),
+                provider_job_identifier=metadata.get("previous_provider_job_id"),
+                status=ProviderJobAttemptRecordStatus.failed,
+                failure_classification=metadata.get("previous_failure_classification") or "provider_failure",
+                fallback_reason=metadata.get("fallback_reason"),
+            )
+            add_attempt(record, previous_attempt_id=previous.id)
+        else:
+            add_attempt(record)
     else:
         previous_provider_job_id = record.provider_job_id
         record.status = ProviderJobRecordStatus(job.status.value)
         record.provider_job_id = job.provider_job_id or record.provider_job_id
+        record.failure = job.failure.model_dump(mode="json") if job.failure else None
         if job.provider_job_id and job.provider_job_id != previous_provider_job_id:
-            latest_attempt = max((attempt.attempt_number for attempt in record.attempts), default=0)
-            db.add(ProviderJobAttemptRecord(
-                provider_job_id=record.id,
-                attempt_number=latest_attempt + 1,
-                status=ProviderJobAttemptRecordStatus.succeeded if job.status.value == "succeeded" else ProviderJobAttemptRecordStatus.started,
-                provider_job_identifier=job.provider_job_id,
-                completed_at=datetime.now(timezone.utc).replace(tzinfo=None) if job.status.value == "succeeded" else None,
-            ))
+            previous_attempt = max(record.attempts, key=lambda item: item.attempt_number, default=None)
+            if previous_attempt and previous_attempt.status is ProviderJobAttemptRecordStatus.started:
+                previous_attempt.status = ProviderJobAttemptRecordStatus.failed
+                previous_attempt.completed_at = datetime.now(timezone.utc).replace(tzinfo=None)
+                previous_attempt.failure_classification = "provider_attempt_replaced"
+            add_attempt(
+                record,
+                previous_attempt_id=previous_attempt.id if previous_attempt else None,
+                fallback_reason=job.provenance.metadata.get("fallback_reason"),
+            )
             record.provider_name = job.provenance.provider
             record.model_version = job.provenance.model_version or job.provenance.model
             record.provenance = job.provenance.model_dump(mode="json")
+        else:
+            latest = max(record.attempts, key=lambda item: item.attempt_number, default=None)
+            if latest:
+                latest.status = attempt_status(job.status.value)
+                latest.provider_name = job.provenance.provider
+                latest.failure_classification = job.failure.code if job.failure else None
+                latest.failure = job.failure.model_dump(mode="json") if job.failure else None
+                if latest.status in {ProviderJobAttemptRecordStatus.succeeded, ProviderJobAttemptRecordStatus.failed, ProviderJobAttemptRecordStatus.cancelled}:
+                    latest.completed_at = datetime.now(timezone.utc).replace(tzinfo=None)
     return record
 
 
@@ -368,17 +420,26 @@ def _current_assets(db, scene_id: str, *, include_drafts: bool = True) -> list[A
 def _promote_assets(db, scene_id: str) -> None:
     candidates = _current_assets(db, scene_id, include_drafts=True)
     for candidate in candidates:
-        if candidate.status is not AssetVersionRecordStatus.draft:
-            continue
         previous = db.query(AssetVersionRecord).filter(
             AssetVersionRecord.scene_id == scene_id,
             AssetVersionRecord.media_type == candidate.media_type,
             AssetVersionRecord.status == AssetVersionRecordStatus.approved,
+            AssetVersionRecord.id != candidate.id,
         ).all()
         for record in previous:
             record.status = AssetVersionRecordStatus.superseded
         candidate.status = AssetVersionRecordStatus.approved
     db.flush()
+
+
+def _approve_candidates_for_assembly(db, scene_id: str) -> list[AssetVersionRecord]:
+    """Mark agent-QA-approved drafts as assembly inputs without superseding history."""
+    candidates = _current_assets(db, scene_id, include_drafts=True)
+    for candidate in candidates:
+        if candidate.status is AssetVersionRecordStatus.draft:
+            candidate.status = AssetVersionRecordStatus.approved
+    db.flush()
+    return _current_assets(db, scene_id, include_drafts=False)
 
 
 def _persist_qa(db, scene_id: str, evaluation, prefix: str) -> None:
@@ -489,6 +550,8 @@ def plan_scene_impl(scene_id: str) -> dict[str, Any]:
         scene = db.query(Scene).filter(Scene.id == scene_id).with_for_update().first()
         if not scene:
             return {"scene_id": scene_id, "skipped": True}
+        if scene.workflow_state is WorkflowStateRecord.cancelled:
+            return {"scene_id": scene_id, "error": "workflow_cancelled"}
         _persist_job(db, result.job, request.idempotency.key)
         plan_record = _persist_plan(db, scene, result.plan)
         _transition(scene, WorkflowStateRecord.generating)
@@ -525,6 +588,10 @@ def generate_visual_impl(scene_id: str, shot_id: str, plan_version: int) -> dict
         )
         bundle = build_provider_bundle(settings_obj=settings)
         result = bundle.visual.generate(request)
+        db.expire_all()
+        scene = db.query(Scene).filter(Scene.id == scene_id).first()
+        if not scene or scene.workflow_state is WorkflowStateRecord.cancelled:
+            return {"ok": False, "error": "workflow_cancelled"}
         if bundle.mode != "fake":
             raise RuntimeError("real visual artifact materialization is not enabled in Phase 4")
         relative = f"{scene_id}/inputs/video/{shot_id}/v{_next_version(db, scene_id, 'video:' + shot_id)}.mp4"
@@ -574,6 +641,10 @@ def generate_audio_impl(scene_id: str, plan_version: int, media_types: list[str]
         request = AudioAgentRequest(plan=plan, idempotency=IdempotencyInfo(key=key, request_hash=_digest(key)))
         bundle = build_provider_bundle(settings_obj=settings)
         result = bundle.audio.generate(request)
+        db.expire_all()
+        scene = db.query(Scene).filter(Scene.id == scene_id).first()
+        if not scene or scene.workflow_state is WorkflowStateRecord.cancelled:
+            return {"ok": False, "error": "workflow_cancelled"}
         if bundle.mode != "fake":
             raise RuntimeError("real audio artifact materialization is not enabled in Phase 4")
         legacy = next(asset for asset in scene.assets if asset.asset_type is AssetType.soundtrack)
@@ -749,7 +820,8 @@ def assemble_scene_impl(scene_id: str, plan_version: int) -> dict[str, Any]:
         if scene.workflow_state is WorkflowStateRecord.cancelled:
             return {"ok": False, "error": "workflow_cancelled"}
         plan = _plan_from_record(plan_record)
-        records = _current_assets(db, scene_id)
+        draft_ids = {record.id for record in _current_assets(db, scene_id) if record.status is AssetVersionRecordStatus.draft}
+        records = _approve_candidates_for_assembly(db, scene_id)
         videos = [record for record in records if record.media_type.startswith("video:")]
         videos.sort(key=lambda record: next(shot.order for shot in plan.shots if f"video:{shot.shot_id}" == record.media_type))
         audio_types = ["narration", "music", "ambience", "sound_effect"]
@@ -762,6 +834,10 @@ def assemble_scene_impl(scene_id: str, plan_version: int) -> dict[str, Any]:
             None,
         )
         if existing and existing.status is FinalRenderRecordStatus.succeeded:
+            if scene.workflow_state is not WorkflowStateRecord.completed:
+                _transition(scene, WorkflowStateRecord.completed)
+                db.commit()
+                RedisGovernance().release_concurrent(scene.user_id, scene.id)
             return {"ok": True, "render_id": existing.id, "skipped": True}
         final_path, manifest = assemble_mp4(
             ARTIFACT_ROOT, scene_id=scene_id, version=version,
@@ -777,7 +853,7 @@ def assemble_scene_impl(scene_id: str, plan_version: int) -> dict[str, Any]:
             _artifact_store().put(ARTIFACT_ROOT / final_path, key=final_path, content_type="video/mp4", metadata={"scene-plan-version": str(plan_version)})
         render = FinalRenderRecord(
             id=f"render-{_digest(scene_id + json.dumps(source_ids))[:28]}",
-            scene_id=scene_id, version=version, status=FinalRenderRecordStatus.succeeded,
+            scene_id=scene_id, version=version, status=FinalRenderRecordStatus.pending,
             artifact_uri=final_path, mime_type="video/mp4", duration_ms=manifest["measured_duration_ms"],
             source_asset_version_ids=source_ids, failure=manifest,
         )
@@ -794,18 +870,29 @@ def assemble_scene_impl(scene_id: str, plan_version: int) -> dict[str, Any]:
         final_result = build_provider_bundle(settings_obj=settings).qa.evaluate(final_request)
         _persist_job(db, final_result.job, final_request.idempotency.key)
         _persist_qa(db, scene_id, final_result.evaluation, "final")
+        db.expire_all()
+        scene = db.query(Scene).filter(Scene.id == scene_id).first()
+        if not scene or scene.workflow_state is WorkflowStateRecord.cancelled:
+            render.status = FinalRenderRecordStatus.failed
+            render.failure = {"code": "workflow_cancelled", "message": "Workflow was cancelled before publication"}
+            db.commit()
+            return {"ok": False, "error": "workflow_cancelled"}
         if final_result.evaluation.recommendation is not QARecommendation.approve:
             render.status = FinalRenderRecordStatus.failed
             render.failure = {"code": "final_qa_failed", "message": "Final render QA rejected the render"}
+            db.query(AssetVersionRecord).filter(AssetVersionRecord.id.in_(draft_ids)).update(
+                {AssetVersionRecord.status: AssetVersionRecordStatus.rejected}, synchronize_session=False
+            )
             record_audit(db, actor_user_id=scene.user_id, event_type="qa_rejection", resource_type="final_render", resource_id=render.id, correlation=scene_id, outcome="rejected", metadata={"recommendation": final_result.evaluation.recommendation.value})
             _fail(db, scene, "Final render QA rejected the render", "final_qa_failed")
             return {"ok": False, "error": "final_qa_failed"}
+        render.status = FinalRenderRecordStatus.succeeded
         record_audit(db, actor_user_id=scene.user_id, event_type="final_render_acceptance", resource_type="final_render", resource_id=render.id, correlation=scene_id, outcome="accepted", metadata={"checksum": manifest["output_checksum"]})
         _promote_assets(db, scene_id)
         _mark_legacy_assets(db, scene, plan, final_path, next(record.artifact_uri for record in audios if record.media_type == "music"))
         _transition(scene, WorkflowStateRecord.completed)
         db.commit()
-        RedisGovernance().release_concurrent(scene.user_id)
+        RedisGovernance().release_concurrent(scene.user_id, scene.id)
         metric_inc("triphony.workflow.successes")
         return {"ok": True, "render_id": render.id}
     except Exception:
@@ -824,13 +911,13 @@ def _regeneration_targets(findings: list[Any], records: list[AssetVersionRecord]
     targets: set[str] = set()
     global_narrative_rejection = False
     for finding in findings:
-        if finding.shot_id:
+        finding_text = f"{finding.code} {finding.message}".lower()
+        audio_targets = [media_name for media_name in ("narration", "music", "ambience", "sound_effect") if media_name in finding_text]
+        if finding.shot_id and not audio_targets:
             targets.add(f"video:{finding.shot_id}")
-        elif "narrative" in finding.code.lower() or "narrative" in finding.message.lower():
+        elif "narrative" in finding_text and not audio_targets:
             global_narrative_rejection = True
-        for media_name in ("narration", "music", "ambience", "sound_effect"):
-            if media_name in finding.code.lower() or media_name in finding.message.lower():
-                targets.add(media_name)
+        targets.update(audio_targets)
     if not targets and not global_narrative_rejection:
         targets = {record.media_type for record in records}
     return targets, global_narrative_rejection
@@ -926,7 +1013,7 @@ def cancel_scene_workflow(scene_id: str) -> dict[str, Any]:
                     job.status = ProviderJobRecordStatus.cancelled
             record_audit(db, actor_user_id=scene.user_id, event_type="workflow_cancellation", resource_type="scene", resource_id=scene_id, correlation=scene_id, outcome="provider_requested", metadata={"provider_errors": cancellation_errors})
             db.commit()
-        RedisGovernance().release_concurrent(user_id)
+        RedisGovernance().release_concurrent(user_id, scene_id)
         metric_inc("triphony.workflow.cancellations")
         return {"scene_id": scene_id, "cancelled": True, "provider_errors": cancellation_errors}
     finally:

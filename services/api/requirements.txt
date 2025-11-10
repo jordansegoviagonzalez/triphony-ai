@@ -6,7 +6,9 @@ pydantic==2.12.5
 pydantic-settings==2.6.1
 python-multipart==0.0.17
 celery==5.4.0
-redis==5.2.0
+kombu[redis]==5.7.0
+redis==6.4.0
+packaging==26.3
 alembic==1.17.2
 passlib==1.7.4
 bcrypt==3.2.2

@@ -94,7 +94,7 @@ class VeoVisualAgent(VisualAgent):
         provider_name="google-vertex-ai",
         supported_media_types=[MediaType.video],
         asynchronous_jobs=True,
-        cancellation_supported=False,
+        cancellation_supported=True,
         deterministic=False,
     )
 
@@ -233,12 +233,36 @@ class VeoVisualAgent(VisualAgent):
             if result.asset is not None:
                 return VisualAgentResult(job=job, asset=result.asset)
             if job.status is ProviderJobStatus.failed:
-                raise ProviderError(ProviderErrorKind.terminal, "Veo generation failed")
+                raise ProviderError(
+                    ProviderErrorKind.terminal,
+                    "Veo generation failed",
+                    provider_name=self.capabilities.provider_name,
+                    provider_job_id=job.provider_job_id,
+                )
             if job.status is ProviderJobStatus.cancelled:
-                raise ProviderError(ProviderErrorKind.terminal, "Veo generation was cancelled")
+                raise ProviderError(
+                    ProviderErrorKind.terminal,
+                    "Veo generation was cancelled",
+                    provider_name=self.capabilities.provider_name,
+                    provider_job_id=job.provider_job_id,
+                )
             if self._clock() >= deadline:
-                raise ProviderError(ProviderErrorKind.timeout, "Veo operation polling timed out", retryable=True)
+                raise ProviderError(
+                    ProviderErrorKind.timeout,
+                    "Veo operation polling timed out",
+                    provider_name=self.capabilities.provider_name,
+                    provider_job_id=job.provider_job_id,
+                    retryable=True,
+                )
             self._sleep(self.config.poll_interval_seconds)
 
     def cancel(self, job_id: str) -> None:
-        del job_id
+        client = self._client_or_create()
+        operation = self._operations.get(job_id, _operation_reference(job_id))
+        operations = getattr(client, "operations", None)
+        cancel = getattr(operations, "cancel", None)
+        if callable(cancel):
+            try:
+                cancel(operation)
+            except Exception as error:
+                raise translate_provider_exception(error) from error

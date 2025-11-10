@@ -15,6 +15,7 @@ from sqlalchemy.orm import Session
 
 from api.models import AuditEvent, OutboxEvent, OutboxEventStatus
 from api.settings import settings
+from triphony_lib.observability import safe_fields
 
 
 def correlation_id(value: str | None = None) -> str:
@@ -36,7 +37,7 @@ def record_audit(db: Session, *, actor_user_id: str | None, event_type: str, res
     event = AuditEvent(
         id=f"audit-{uuid.uuid4().hex}", actor_user_id=actor_user_id, event_type=event_type,
         resource_type=resource_type, resource_id=resource_id, correlation_id=correlation,
-        outcome=outcome, safe_metadata=metadata or {},
+        outcome=outcome, safe_metadata=safe_fields(metadata or {}),
     )
     db.add(event)
     return event
@@ -76,6 +77,39 @@ class RedisGovernance:
         concurrent_key = f"triphony:quota:concurrent:{user_id}"
         daily_key = f"triphony:quota:daily:{user_id}:{day}"
         try:
+            if hasattr(self.client, "eval"):
+                result = self.client.eval(
+                    """
+                    local rate = redis.call('SET', KEYS[1], '1', 'NX', 'EX', ARGV[1])
+                    if not rate then return {0, 'submission_rate_limit', ARGV[1]} end
+                    local concurrent = tonumber(redis.call('GET', KEYS[2]) or '0')
+                    local daily = tonumber(redis.call('GET', KEYS[3]) or '0')
+                    if concurrent >= tonumber(ARGV[2]) then
+                        redis.call('DEL', KEYS[1])
+                        return {0, 'concurrent_workflow_limit', '5'}
+                    end
+                    if daily >= tonumber(ARGV[3]) then
+                        redis.call('DEL', KEYS[1])
+                        return {0, 'daily_generation_quota', '60'}
+                    end
+                    redis.call('INCR', KEYS[2])
+                    redis.call('EXPIRE', KEYS[2], 3600)
+                    redis.call('INCR', KEYS[3])
+                    redis.call('EXPIRE', KEYS[3], 86400)
+                    return {1, 'allowed', '0'}
+                    """,
+                    3,
+                    rate_key,
+                    concurrent_key,
+                    daily_key,
+                    settings.submission_rate_limit_seconds,
+                    settings.max_concurrent_workflows,
+                    settings.daily_generation_quota,
+                )
+                allowed_flag, reason_value, retry_value = result
+                reason_text = reason_value.decode() if isinstance(reason_value, bytes) else str(reason_value)
+                return bool(int(allowed_flag)), reason_text, int(retry_value) or None
+
             if not self.client.set(rate_key, "1", nx=True, ex=settings.submission_rate_limit_seconds):
                 return False, "submission_rate_limit", settings.submission_rate_limit_seconds
             pipe = self.client.pipeline(transaction=True)
@@ -87,8 +121,12 @@ class RedisGovernance:
                 return True, "allowed", None
             raise RuntimeError("usage governance datastore unavailable") from error
         if int(concurrent or 0) >= settings.max_concurrent_workflows:
+            if hasattr(self.client, "delete"):
+                self.client.delete(rate_key)
             return False, "concurrent_workflow_limit", 5
         if int(daily or 0) >= settings.daily_generation_quota:
+            if hasattr(self.client, "delete"):
+                self.client.delete(rate_key)
             return False, "daily_generation_quota", 60
         pipe = self.client.pipeline(transaction=True)
         pipe.incr(concurrent_key)
@@ -103,8 +141,43 @@ class RedisGovernance:
             raise RuntimeError("usage governance datastore unavailable") from error
         return True, "allowed", None
 
-    def release_concurrent(self, user_id: str) -> None:
+    def bind_reservation(self, user_id: str, scene_id: str) -> None:
+        key = f"triphony:quota:reservation:{scene_id}"
         try:
+            self.client.set(key, user_id, nx=True, ex=60 * 60 * 24 * 7)
+        except Exception as error:
+            if settings.provider_mode not in {"fake", "mock"}:
+                raise RuntimeError("usage governance datastore unavailable") from error
+
+    def release_concurrent(self, user_id: str, reservation_id: str | None = None) -> None:
+        try:
+            if reservation_id:
+                reservation_key = f"triphony:quota:reservation:{reservation_id}"
+                owner = self.client.get(reservation_key)
+                if isinstance(owner, bytes):
+                    owner = owner.decode()
+                if owner != user_id:
+                    return
+                if hasattr(self.client, "eval"):
+                    self.client.eval(
+                        """
+                        if redis.call('GET', KEYS[1]) == ARGV[1] then
+                            redis.call('DEL', KEYS[1])
+                            local remaining = redis.call('DECRBY', KEYS[2], 1)
+                            if remaining <= 0 then redis.call('DEL', KEYS[2]) end
+                        end
+                        return 1
+                        """,
+                        2,
+                        reservation_key,
+                        f"triphony:quota:concurrent:{user_id}",
+                        user_id,
+                    )
+                    return
+                if hasattr(self.client, "delete"):
+                    self.client.delete(reservation_key)
+                else:
+                    return
             key = f"triphony:quota:concurrent:{user_id}"
             remaining = self.client.decrby(key, 1)
             if int(remaining) <= 0:

@@ -25,7 +25,10 @@ class RedisCircuitBreaker:
         window_seconds: float = 60.0,
         cooldown_seconds: float = 30.0,
         max_half_open_probes: int = 1,
-        clock: Callable[[], float] = time.monotonic,
+        # Redis state is shared across processes and hosts, so timestamps must
+        # use a shared wall-clock domain rather than process-local monotonic
+        # time.
+        clock: Callable[[], float] = time.time,
         on_state_change: Callable[[str, str, str], None] | None = None,
     ) -> None:
         if failure_threshold <= 0 or max_half_open_probes <= 0:
@@ -71,6 +74,8 @@ class RedisCircuitBreaker:
     def record_success(self) -> None:
         old = self.state().state
         self._write(CircuitState("closed", 0))
+        if hasattr(self.redis, "delete"):
+            self.redis.delete(f"{self.key}:probe")
         if old != "closed":
             self.on_state_change(old, "closed", "success")
 
@@ -83,6 +88,8 @@ class RedisCircuitBreaker:
         failures = current.failures + 1
         if failures >= self.failure_threshold or current.state == "half_open":
             self._write(CircuitState("open", failures, self.clock()))
+            if hasattr(self.redis, "delete"):
+                self.redis.delete(f"{self.key}:probe")
             self.on_state_change(current.state, "open", "failure_threshold")
         else:
             self._write(CircuitState("closed", failures))

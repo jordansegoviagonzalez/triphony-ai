@@ -30,7 +30,18 @@ _histograms: dict[str, Any] = {}
 
 
 def safe_fields(fields: dict[str, Any]) -> dict[str, Any]:
-    return {key: "[REDACTED]" if _SENSITIVE.search(key) else value for key, value in fields.items()}
+    def sanitize(key: str, value: Any) -> Any:
+        if _SENSITIVE.search(key):
+            return "[REDACTED]"
+        if isinstance(value, dict):
+            return {str(child_key): sanitize(str(child_key), child_value) for child_key, child_value in value.items()}
+        if isinstance(value, list):
+            return [sanitize(key, child) for child in value]
+        if isinstance(value, tuple):
+            return tuple(sanitize(key, child) for child in value)
+        return value
+
+    return {str(key): sanitize(str(key), value) for key, value in fields.items()}
 
 
 def json_log(logger: logging.Logger, level: int, message: str, **fields: Any) -> None:

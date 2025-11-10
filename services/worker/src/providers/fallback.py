@@ -16,7 +16,10 @@ ELIGIBLE_FALLBACK_ERRORS = frozenset({
 
 
 def fallback_allowed(error: ProviderError, *, circuit_open: bool = False) -> bool:
-    return circuit_open or error.kind in ELIGIBLE_FALLBACK_ERRORS
+    # An already-open circuit may bypass the primary request, but it must not
+    # turn an authentication, safety, validation, or terminal error into a
+    # fallback-eligible failure after the primary was attempted.
+    return error.kind in ELIGIBLE_FALLBACK_ERRORS
 
 
 @dataclass
@@ -39,14 +42,26 @@ class ActivePassiveVisualAgent(VisualAgent):
         if cached is not None:
             return cached
 
-        def use_fallback(reason: str) -> VisualAgentResult:
+        def use_fallback(reason: str, primary_error: ProviderError | None = None) -> VisualAgentResult:
             self.on_fallback(reason)
             result = self.fallback.generate(request)
+            primary_provider = getattr(self.primary.capabilities, "provider_name", "primary")
+            fallback_metadata = {
+                **result.job.provenance.metadata,
+                "fallback_from": primary_provider,
+                "fallback_reason": reason,
+            }
+            if primary_error is not None:
+                fallback_metadata.update({
+                    "previous_provider": primary_error.provider_name or primary_provider,
+                    "previous_provider_job_id": primary_error.provider_job_id,
+                    "previous_failure_classification": primary_error.kind.value,
+                })
             result = result.model_copy(update={
                 "job": result.job.model_copy(update={
                     "job_id": request.idempotency.key,
                     "provenance": result.job.provenance.model_copy(update={
-                        "metadata": {**result.job.provenance.metadata, "fallback_from": "google-vertex-ai", "fallback_reason": reason}
+                        "metadata": fallback_metadata,
                     }),
                 })
             })
@@ -63,7 +78,7 @@ class ActivePassiveVisualAgent(VisualAgent):
             self.on_primary_failure(error)
             if not self.fallback_enabled or not fallback_allowed(error, circuit_open=self.circuit_open()):
                 raise
-            return use_fallback(error.kind.value)
+            return use_fallback(error.kind.value, error)
 
     def cancel(self, job_id: str) -> None:
         first_error: Exception | None = None

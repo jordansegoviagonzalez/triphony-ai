@@ -4,13 +4,15 @@ from __future__ import annotations
 
 import hashlib
 import mimetypes
+import os
 import pathlib
 import re
 import shutil
+import tempfile
 from dataclasses import dataclass
 from typing import Any, Protocol
 
-from triphony_lib.observability import metric_observe, span
+from triphony_lib.observability import metric_inc, metric_observe, span
 
 
 class ArtifactStoreError(RuntimeError):
@@ -27,21 +29,78 @@ class ArtifactMetadata:
 
 
 class ArtifactStore(Protocol):
-    def put(self, source: pathlib.Path, *, key: str, content_type: str, metadata: dict[str, str] | None = None) -> ArtifactMetadata: ...
+    def put(
+        self,
+        source: pathlib.Path,
+        *,
+        key: str,
+        content_type: str,
+        metadata: dict[str, str] | None = None,
+        expected_size: int | None = None,
+        expected_checksum_sha256: str | None = None,
+    ) -> ArtifactMetadata: ...
     def head(self, key: str) -> ArtifactMetadata: ...
     def signed_get_url(self, key: str, *, expires_in: int) -> str | None: ...
 
 
 _SAFE_COMPONENT = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/-]{0,255}$")
+_SAFE_CHECKSUM = re.compile(r"^[0-9a-f]{64}$")
+_CONTENT_TYPES = {
+    ".mp4": "video/mp4",
+    ".wav": "audio/wav",
+    ".mp3": "audio/mpeg",
+    ".png": "image/png",
+    ".jpg": "image/jpeg",
+    ".json": "application/json",
+    ".txt": "text/plain",
+}
+
+
+def _validate_relative_key(value: str, *, label: str) -> str:
+    if not isinstance(value, str) or not value or "\\" in value or "//" in value:
+        raise ArtifactStoreError(f"unsafe {label}")
+    raw_parts = value.split("/")
+    if any(part in {"", ".", ".."} for part in raw_parts):
+        raise ArtifactStoreError(f"unsafe {label}")
+    path = pathlib.PurePosixPath(value)
+    if path.is_absolute() or any(part in {"", ".", ".."} for part in path.parts):
+        raise ArtifactStoreError(f"unsafe {label}")
+    return value
+
+
+def _validate_content_type(key: str, content_type: str) -> None:
+    if not content_type or content_type != _CONTENT_TYPES.get(pathlib.PurePosixPath(key).suffix.lower()):
+        raise ArtifactStoreError("content type does not match the artifact extension")
+
+
+def _validate_expectations(*, size: int, checksum: str, expected_size: int | None, expected_checksum_sha256: str | None) -> None:
+    if expected_size is not None and (expected_size < 0 or size != expected_size):
+        raise ArtifactStoreError("artifact size does not match the expected size")
+    if expected_checksum_sha256 is not None:
+        if not _SAFE_CHECKSUM.fullmatch(expected_checksum_sha256) or checksum != expected_checksum_sha256:
+            raise ArtifactStoreError("artifact checksum does not match the expected checksum")
 
 
 def safe_artifact_key(scene_id: str, asset_version_id: str, filename: str, *, prefix: str = "triphony") -> str:
     if not all(re.fullmatch(r"[A-Za-z0-9-]{1,128}", value) for value in (scene_id, asset_version_id)):
         raise ArtifactStoreError("invalid artifact identity")
-    extension = pathlib.PurePath(filename).suffix.lower()
+    if not isinstance(filename, str) or "\\" in filename:
+        raise ArtifactStoreError("unsafe artifact filename")
+    filename_path = pathlib.PurePosixPath(filename)
+    raw_filename_parts = filename.split("/")
+    if (
+        filename_path.is_absolute()
+        or len(raw_filename_parts) != 1
+        or raw_filename_parts[0] in {"", ".", ".."}
+        or filename_path.name in {"", ".", ".."}
+    ):
+        raise ArtifactStoreError("unsafe artifact filename")
+    extension = filename_path.suffix.lower()
     if extension not in {".mp4", ".wav", ".mp3", ".png", ".jpg", ".json", ".txt"}:
         raise ArtifactStoreError("unsupported artifact extension")
-    key = "/".join(part.strip("/") for part in (prefix, scene_id, asset_version_id + extension) if part)
+    if prefix:
+        _validate_relative_key(prefix, label="artifact prefix")
+    key = "/".join(part for part in (prefix, scene_id, asset_version_id + extension) if part)
     if not _SAFE_COMPONENT.fullmatch(key):
         raise ArtifactStoreError("unsafe artifact key")
     return key
@@ -62,33 +121,66 @@ class LocalArtifactStore:
         self.root.mkdir(parents=True, exist_ok=True)
 
     def _path(self, key: str) -> pathlib.Path:
+        _validate_relative_key(key, label="artifact key")
         path = (self.root / key).resolve()
         if not path.is_relative_to(self.root):
             raise ArtifactStoreError("artifact path escaped private root")
         return path
 
-    def put(self, source: pathlib.Path, *, key: str, content_type: str, metadata: dict[str, str] | None = None) -> ArtifactMetadata:
+    def put(
+        self,
+        source: pathlib.Path,
+        *,
+        key: str,
+        content_type: str,
+        metadata: dict[str, str] | None = None,
+        expected_size: int | None = None,
+        expected_checksum_sha256: str | None = None,
+    ) -> ArtifactMetadata:
         with span("storage.put", backend="local", key=key, content_type=content_type):
             source = source.resolve()
             if not source.is_file() or source.stat().st_size > self.max_object_size:
                 raise ArtifactStoreError("artifact is missing or exceeds the configured size")
+            _validate_content_type(key, content_type)
+            checksum = _checksum(source)
+            _validate_expectations(
+                size=source.stat().st_size,
+                checksum=checksum,
+                expected_size=expected_size,
+                expected_checksum_sha256=expected_checksum_sha256,
+            )
             target = self._path(key)
             target.parent.mkdir(parents=True, exist_ok=True)
-            temporary = target.with_suffix(target.suffix + ".tmp")
-            shutil.copyfile(source, temporary)
-            temporary.replace(target)
-            return ArtifactMetadata(key, content_type, target.stat().st_size, _checksum(target))
+            descriptor, temporary_name = tempfile.mkstemp(prefix=f".{target.name}.tmp-", dir=str(target.parent))
+            os.close(descriptor)
+            temporary = pathlib.Path(temporary_name)
+            try:
+                shutil.copyfile(source, temporary)
+                os.replace(temporary, target)
+            except Exception as error:
+                raise ArtifactStoreError("local artifact publication failed") from error
+            finally:
+                temporary.unlink(missing_ok=True)
+            published = self.head(key)
+            if published.content_length != source.stat().st_size or published.checksum_sha256 != checksum:
+                raise ArtifactStoreError("local artifact verification failed")
+            metric_inc("triphony.storage.uploads", backend="local")
+            metric_observe("triphony.storage.bytes", float(published.content_length), backend="local")
+            return ArtifactMetadata(key, content_type, published.content_length, published.checksum_sha256)
 
     def head(self, key: str) -> ArtifactMetadata:
         with span("storage.head", backend="local", key=key):
             path = self._path(key)
             if not path.is_file():
                 raise ArtifactStoreError("artifact not found")
-            return ArtifactMetadata(key, mimetypes.guess_type(path.name)[0] or "application/octet-stream", path.stat().st_size, _checksum(path))
+            size = path.stat().st_size
+            checksum = _checksum(path)
+            metric_inc("triphony.storage.downloads", backend="local")
+            return ArtifactMetadata(key, mimetypes.guess_type(path.name)[0] or "application/octet-stream", size, checksum)
 
     def signed_get_url(self, key: str, *, expires_in: int) -> str | None:
         with span("storage.signed_get_url", backend="local", key=key):
-            self._path(key)
+            self.head(key)
             return None
 
 
@@ -96,6 +188,14 @@ class S3ArtifactStore:
     def __init__(self, *, bucket: str, region: str, prefix: str = "triphony", encryption: str = "AES256", kms_key_id: str | None = None, client: Any | None = None, max_object_size: int = 512 * 1024 * 1024, multipart_threshold_bytes: int = 64 * 1024 * 1024, request_timeout_seconds: int = 120) -> None:
         if not bucket or not region:
             raise ArtifactStoreError("S3 bucket and region are required")
+        if encryption not in {"AES256", "aws:kms"} or (encryption == "aws:kms" and not kms_key_id):
+            raise ArtifactStoreError("S3 encryption configuration is invalid")
+        if max_object_size <= 0 or multipart_threshold_bytes <= 0:
+            raise ArtifactStoreError("S3 size limits must be positive")
+        if prefix and prefix != prefix.strip("/"):
+            raise ArtifactStoreError("unsafe S3 prefix")
+        if prefix:
+            _validate_relative_key(prefix, label="S3 prefix")
         self.bucket = bucket
         self.region = region
         self.prefix = prefix.strip("/")
@@ -107,9 +207,7 @@ class S3ArtifactStore:
         self.client = client
 
     def _key(self, key: str) -> str:
-        candidate = key.strip("/")
-        if not candidate or any(part in {"", ".", ".."} for part in pathlib.PurePosixPath(candidate).parts):
-            raise ArtifactStoreError("unsafe S3 object key")
+        candidate = _validate_relative_key(key, label="S3 object key")
         if not _SAFE_COMPONENT.fullmatch(candidate):
             raise ArtifactStoreError("unsafe S3 object key")
         return "/".join(part for part in (self.prefix, candidate) if part)
@@ -129,19 +227,44 @@ class S3ArtifactStore:
             )
         return self.client
 
-    def put(self, source: pathlib.Path, *, key: str, content_type: str, metadata: dict[str, str] | None = None) -> ArtifactMetadata:
+    def put(
+        self,
+        source: pathlib.Path,
+        *,
+        key: str,
+        content_type: str,
+        metadata: dict[str, str] | None = None,
+        expected_size: int | None = None,
+        expected_checksum_sha256: str | None = None,
+    ) -> ArtifactMetadata:
         with span("storage.put", backend="s3", key=key, content_type=content_type):
             source = source.resolve()
             if not source.is_file() or source.stat().st_size > self.max_object_size:
                 raise ArtifactStoreError("artifact is missing or exceeds the configured size")
+            _validate_content_type(key, content_type)
             checksum = _checksum(source)
+            _validate_expectations(
+                size=source.stat().st_size,
+                checksum=checksum,
+                expected_size=expected_size,
+                expected_checksum_sha256=expected_checksum_sha256,
+            )
             extra_metadata = {**(metadata or {}), "checksum-sha256": checksum}
             extra: dict[str, Any] = {"ContentType": content_type, "Metadata": extra_metadata, "ServerSideEncryption": self.encryption}
             if self.encryption == "aws:kms" and self.kms_key_id:
                 extra["SSEKMSKeyId"] = self.kms_key_id
             try:
                 object_key = self._key(key)
-                from boto3.s3.transfer import TransferConfig
+                try:
+                    from boto3.s3.transfer import TransferConfig
+                except ModuleNotFoundError:
+                    if self.client is None:
+                        raise
+
+                    class TransferConfig:  # type: ignore[no-redef]
+                        def __init__(self, multipart_threshold: int) -> None:
+                            self.multipart_threshold = multipart_threshold
+
                 self._client().upload_file(
                     str(source), self.bucket, object_key, ExtraArgs=extra,
                     Config=TransferConfig(multipart_threshold=self.multipart_threshold_bytes),
@@ -153,6 +276,7 @@ class S3ArtifactStore:
             remote_checksum = str(response.get("Metadata", {}).get("checksum-sha256", ""))
             if length != source.stat().st_size or remote_checksum != checksum:
                 raise ArtifactStoreError("S3 artifact checksum or size verification failed")
+            metric_inc("triphony.storage.uploads", backend="s3")
             metric_observe("triphony.storage.bytes", float(length), backend="s3")
             return ArtifactMetadata(key, content_type, length, checksum, response.get("VersionId"))
 
@@ -163,7 +287,10 @@ class S3ArtifactStore:
             except Exception as error:
                 raise ArtifactStoreError("S3 artifact metadata lookup failed") from error
             length = int(response["ContentLength"])
+            if length > self.max_object_size:
+                raise ArtifactStoreError("S3 artifact exceeds the configured size")
             metric_observe("triphony.storage.bytes", float(length), backend="s3")
+            metric_inc("triphony.storage.downloads", backend="s3")
             return ArtifactMetadata(key, response.get("ContentType", "application/octet-stream"), length, response.get("Metadata", {}).get("checksum-sha256", ""), response.get("VersionId"))
 
     def signed_get_url(self, key: str, *, expires_in: int) -> str:

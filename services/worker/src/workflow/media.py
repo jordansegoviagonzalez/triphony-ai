@@ -76,7 +76,7 @@ def write_fake_video(root: pathlib.Path, relative: str, duration_ms: int, seed: 
     _run(
         [
             "ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-f", "lavfi",
-            "-i", f"testsrc2=size=640x360:rate=24,drawtext=text='{seed[:12]}':x=10:y=10:fontsize=18:fontcolor=white",
+            "-i", "testsrc2=size=640x360:rate=24",
             "-t", f"{duration:.3f}", "-an", "-c:v", "libx264", "-pix_fmt", "yuv420p",
             "-movflags", "+faststart", str(path),
         ],

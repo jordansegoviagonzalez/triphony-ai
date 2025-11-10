@@ -1,10 +1,11 @@
 import hashlib
+from datetime import datetime, timezone
 from pathlib import Path
 
 import pytest
 
 from api.governance import add_outbox_event, safety_gate
-from api.models import OutboxEvent, ProviderJobAttemptRecord, ProviderJobRecord, Scene, WorkflowStateRecord
+from api.models import DeadLetterRecord, OutboxEvent, OutboxEventStatus, ProviderJobAttemptRecord, ProviderJobRecord, Scene, WorkflowStateRecord
 from providers.config import ProviderConfig
 from providers.errors import ProviderError, ProviderErrorKind
 from providers.fallback import ActivePassiveVisualAgent
@@ -15,9 +16,10 @@ from resilience.retry import RetryPolicy
 from triphony_lib.fakes import FakeNarrativeDirector, FakeVisualAgent
 from triphony_lib.storage import ArtifactStoreError, LocalArtifactStore, S3ArtifactStore, safe_artifact_key
 from triphony_lib.observability import clear_correlation_id, current_correlation_id, metric_inc, safe_fields, set_correlation_id, span
-from triphony_lib.domain import IdempotencyInfo, VisualAgentRequest
+from triphony_lib.domain import IdempotencyInfo, ProviderJobStatus, VisualAgentRequest
 from triphony_lib.domain import ProvenanceMetadata
 from workflow.orchestrator import _create_dead_letter, _persist_job
+import workflow.outbox as outbox
 from shared.celery_app import celery_app
 
 
@@ -85,7 +87,7 @@ def test_runway_adapter_is_lazy_idempotent_and_provider_neutral():
 
 def test_fallback_policy_only_uses_runway_for_eligible_provider_failure():
     class Down:
-        capabilities = FakeVisualAgent.capabilities
+        capabilities = FakeVisualAgent.capabilities.model_copy(update={"provider_name": "google-vertex-ai"})
         def generate(self, _request):
             raise ProviderError(ProviderErrorKind.unavailable, "unavailable", retryable=True)
         def cancel(self, _job_id):
@@ -95,6 +97,30 @@ def test_fallback_policy_only_uses_runway_for_eligible_provider_failure():
     result = agent.generate(_visual_request())
     assert result.job.provenance.metadata["fallback_from"] == "google-vertex-ai"
     assert events == ["provider_unavailable"]
+
+
+def test_circuit_open_does_not_override_ineligible_failure_policy():
+    class Down:
+        capabilities = FakeVisualAgent.capabilities.model_copy(update={"provider_name": "google-vertex-ai"})
+
+        def generate(self, _request):
+            raise ProviderError(ProviderErrorKind.authentication, "provider authentication failed")
+
+        def cancel(self, _job_id):
+            pass
+
+    calls = []
+
+    class Fallback(FakeVisualAgent):
+        def generate(self, request):
+            calls.append("fallback")
+            return super().generate(request)
+
+    circuit_states = iter([False, True])
+    with pytest.raises(ProviderError) as error:
+        ActivePassiveVisualAgent(Down(), Fallback(), True, circuit_open=lambda: next(circuit_states)).generate(_visual_request())
+    assert error.value.kind is ProviderErrorKind.authentication
+    assert calls == []
 
 
 def test_fallback_is_idempotent_and_terminal_failures_do_not_fallback():
@@ -132,10 +158,26 @@ def test_fallback_is_idempotent_and_terminal_failures_do_not_fallback():
 
 
 def test_provider_attempt_lineage_preserves_primary_and_fallback(db_session):
-    primary = FakeVisualAgent().generate(_visual_request()).job.model_copy(update={"provider_job_id": "veo-operation-1"})
+    primary = FakeVisualAgent().generate(_visual_request()).job.model_copy(update={
+        "provider_job_id": "veo-operation-1",
+        "status": ProviderJobStatus.failed,
+        "failure": ProviderError(ProviderErrorKind.unavailable, "provider unavailable", retryable=True).failure_info(),
+        "provenance": ProvenanceMetadata(source="provider", provider="google-vertex-ai", model="veo"),
+    })
     fallback = primary.model_copy(update={
         "provider_job_id": "runway-task-1",
-        "provenance": ProvenanceMetadata(source="provider", provider="runway", model="gen4.5"),
+        "status": ProviderJobStatus.succeeded,
+        "failure": None,
+        "provenance": ProvenanceMetadata(
+            source="provider", provider="runway", model="gen4.5",
+            metadata={
+                "fallback_from": "google-vertex-ai",
+                "fallback_reason": "provider_unavailable",
+                "previous_provider": "google-vertex-ai",
+                "previous_provider_job_id": "veo-operation-1",
+                "previous_failure_classification": "provider_unavailable",
+            },
+        ),
     })
     _persist_job(db_session, primary, primary.idempotency.key)
     db_session.commit()
@@ -145,6 +187,10 @@ def test_provider_attempt_lineage_preserves_primary_and_fallback(db_session):
     attempts = db_session.query(ProviderJobAttemptRecord).filter(ProviderJobAttemptRecord.provider_job_id == record.id).all()
     assert record.provider_name == "runway"
     assert [attempt.provider_job_identifier for attempt in attempts] == ["veo-operation-1", "runway-task-1"]
+    assert attempts[0].provider_name == "google-vertex-ai"
+    assert attempts[0].failure_classification == "provider_unavailable"
+    assert attempts[1].fallback_reason == "provider_unavailable"
+    assert attempts[1].previous_attempt_id == attempts[0].id
 
 
 def test_circuit_breaker_is_shared_through_redis_and_ignores_user_errors():
@@ -177,6 +223,26 @@ def test_storage_keys_and_local_store_are_private_and_atomic(tmp_path: Path):
     metadata = store.put(source, key=key, content_type="video/mp4")
     assert metadata.content_length == 4
     assert store.signed_get_url(key, expires_in=60) is None
+
+
+@pytest.mark.parametrize("filename", ["../render.mp4", "./render.mp4", "/tmp/render.mp4", "nested/render.mp4"])
+def test_storage_rejects_unsafe_filenames(filename):
+    with pytest.raises(ArtifactStoreError):
+        safe_artifact_key("scene-1", "version-1", filename)
+
+
+def test_storage_validates_content_type_size_checksum_and_s3_absolute_keys(tmp_path: Path):
+    source = tmp_path / "render.mp4"
+    source.write_bytes(b"data")
+    store = LocalArtifactStore(tmp_path / "private")
+    with pytest.raises(ArtifactStoreError):
+        store.put(source, key="scene-1/version-1.mp4", content_type="audio/wav")
+    with pytest.raises(ArtifactStoreError):
+        store.put(source, key="scene-1/version-1.mp4", content_type="video/mp4", expected_size=5)
+    with pytest.raises(ArtifactStoreError):
+        store.put(source, key="scene-1/version-1.mp4", content_type="video/mp4", expected_checksum_sha256="0" * 64)
+    with pytest.raises(ArtifactStoreError):
+        S3ArtifactStore(bucket="private-bucket", region="us-west-2", prefix="media")._key("/absolute/render.mp4")
 
 
 def test_s3_adapter_builds_private_upload_and_signed_get_without_network(tmp_path: Path):
@@ -276,3 +342,63 @@ def test_terminal_worker_failure_creates_sanitized_dead_letter(monkeypatch):
     assert captured["scene_id"] == "scene-1"
     assert captured["replay_eligible"] is True
     assert captured["details"] == {"source": "worker_task"}
+
+
+def test_outbox_dispatch_is_idempotent_and_retries_with_backoff(db_session, monkeypatch):
+    event = add_outbox_event(
+        db_session,
+        event_key="scene:outbox-dispatch:start",
+        event_type="scene.workflow.start",
+        payload={"scene_id": "outbox-scene"},
+        correlation="corr-outbox",
+    )
+    db_session.commit()
+    event_key = event.event_key
+    monkeypatch.setattr(outbox, "SessionLocal", lambda: db_session)
+    published = []
+    assert outbox.dispatch_outbox(publish=lambda item: published.append(item.event_key)) == {"published": 1, "failed": 0}
+    assert published == [event_key]
+    assert outbox.dispatch_outbox(publish=lambda item: published.append(item.event_key)) == {"published": 0, "failed": 0}
+
+    retry = add_outbox_event(
+        db_session,
+        event_key="scene:outbox-retry:start",
+        event_type="scene.workflow.start",
+        payload={"scene_id": "retry-scene"},
+        correlation="corr-retry",
+    )
+    db_session.commit()
+    retry_id = retry.id
+    before = datetime.now(timezone.utc).replace(tzinfo=None)
+    assert outbox.dispatch_outbox(publish=lambda _item: (_ for _ in ()).throw(RuntimeError("broker unavailable"))) == {"published": 0, "failed": 1}
+    db_session.expire_all()
+    assert db_session.get(OutboxEvent, retry_id).status is OutboxEventStatus.pending
+    assert db_session.get(OutboxEvent, retry_id).available_at > before
+
+
+def test_outbox_reconciliation_and_dead_letter_replay_are_operator_scoped(db_session, monkeypatch):
+    scene = Scene(id="reconcile-scene", prompt="reconcile", workflow_state=WorkflowStateRecord.generating)
+    db_session.add(scene)
+    dead_letter = DeadLetterRecord(
+        id="dlq-replay-1",
+        task_type="scene.workflow.start",
+        failure_code="outbox_publish_failed",
+        attempt_count=5,
+        correlation_id="corr-replay",
+        replay_eligible=True,
+        resolved=False,
+        first_failed_at=datetime.now(timezone.utc).replace(tzinfo=None),
+        last_failed_at=datetime.now(timezone.utc).replace(tzinfo=None),
+        safe_details={"task_name": "worker.tasks.start_scene_workflow", "task_args": ["reconcile-scene"]},
+    )
+    db_session.add(dead_letter)
+    db_session.commit()
+    dead_letter_id = dead_letter.id
+    monkeypatch.setattr(outbox, "SessionLocal", lambda: db_session)
+    sent = []
+    monkeypatch.setattr(outbox.celery_app, "send_task", lambda *args, **kwargs: sent.append((args, kwargs)))
+    assert outbox.reconcile_workflows() == {"dispatched": 1}
+    assert sent[0][0][0] == "worker.tasks.start_scene_workflow"
+    assert outbox.replay_dead_letter(dead_letter_id) is True
+    assert sent[-1][0][0] == "worker.tasks.start_scene_workflow"
+    assert db_session.get(DeadLetterRecord, dead_letter_id).resolved is True

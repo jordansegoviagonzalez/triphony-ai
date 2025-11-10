@@ -31,12 +31,16 @@ class ProviderError(AgentError):
         message: str,
         *,
         provider_request_id: str | None = None,
+        provider_name: str | None = None,
+        provider_job_id: str | None = None,
         retryable: bool = False,
     ) -> None:
         super().__init__(message)
         self.kind = kind
         self.safe_message = message
         self.provider_request_id = provider_request_id
+        self.provider_name = provider_name
+        self.provider_job_id = provider_job_id
         self.retryable = retryable
 
     def failure_info(self) -> FailureInfo:

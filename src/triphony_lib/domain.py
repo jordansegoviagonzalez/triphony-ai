@@ -284,6 +284,10 @@ class ProviderJobAttempt(DomainModel):
     attempt_number: int = Field(ge=1)
     status: ProviderAttemptStatus
     provider_job_id: str | None = Field(default=None, max_length=255)
+    provider_name: str = Field(default="unknown", min_length=1, max_length=128)
+    failure_classification: str | None = Field(default=None, max_length=128)
+    fallback_reason: str | None = Field(default=None, max_length=255)
+    previous_attempt_id: int | None = Field(default=None, ge=1)
     failure: FailureInfo | None = None
     started_at: datetime = Field(default_factory=utc_now)
     finished_at: datetime | None = None

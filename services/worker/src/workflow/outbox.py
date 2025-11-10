@@ -3,14 +3,14 @@
 from __future__ import annotations
 
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from api.governance import record_audit
 from api.models import DeadLetterRecord, OutboxEvent, OutboxEventStatus, Scene, WorkflowStateRecord
 from shared.celery_app import celery_app
 from workflow.orchestrator import SessionLocal
-from triphony_lib.observability import json_log, metric_inc, span
+from triphony_lib.observability import json_log, metric_inc, safe_fields, span
 
 
 def dispatch_outbox(*, publish: Any | None = None, limit: int = 100) -> dict[str, int]:
@@ -34,18 +34,46 @@ def dispatch_outbox(*, publish: Any | None = None, limit: int = 100) -> dict[str
                     publish(event)
                 event.status = OutboxEventStatus.published
                 event.published_at = datetime.now(timezone.utc).replace(tzinfo=None)
+                record_audit(
+                    db,
+                    actor_user_id=None,
+                    event_type="outbox_publication",
+                    resource_type="outbox_event",
+                    resource_id=event.id,
+                    correlation=event.correlation_id,
+                    outcome="published",
+                    metadata={"event_type": event.event_type},
+                )
                 published += 1
             except Exception:
                 event.status = OutboxEventStatus.failed if event.attempts >= 5 else OutboxEventStatus.pending
                 event.last_error = "outbox publication failed"
+                event.available_at = datetime.now(timezone.utc).replace(tzinfo=None) + timedelta(
+                    seconds=min(300, 2 ** min(event.attempts, 8))
+                )
                 metric_inc("triphony.outbox.publication_failures", event_type=event.event_type)
                 json_log(__import__("logging").getLogger("triphony.worker"), __import__("logging").ERROR, "outbox_publication_failed", event_type=event.event_type, event_key=event.event_key, attempts=event.attempts)
+                record_audit(
+                    db,
+                    actor_user_id=None,
+                    event_type="outbox_publication",
+                    resource_type="outbox_event",
+                    resource_id=event.id,
+                    correlation=event.correlation_id,
+                    outcome="failed",
+                    metadata={"event_type": event.event_type, "attempt": event.attempts},
+                )
                 if event.attempts >= 5:
                     create_dead_letter(
                         scene_id=event.payload.get("scene_id"), provider_job_id=None,
                         task_type=event.event_type, failure_code="outbox_publish_failed",
                         attempt_count=event.attempts, correlation_id=event.correlation_id,
-                        replay_eligible=True, details={"source": "outbox_dispatch"},
+                        replay_eligible=True,
+                        details={
+                            "source": "outbox_dispatch",
+                            "task_name": "worker.tasks.start_scene_workflow",
+                            "task_args": [event.payload.get("scene_id")],
+                        },
                     )
                     metric_inc("triphony.dead_letters.created", task_type=event.event_type)
                 failed += 1
@@ -94,7 +122,7 @@ def create_dead_letter(*, scene_id: str | None, provider_job_id: str | None, tas
         record = DeadLetterRecord(
             id=f"dlq-{uuid.uuid4().hex}", scene_id=scene_id, provider_job_id=provider_job_id,
             task_type=task_type, failure_code=failure_code[:128], attempt_count=attempt_count,
-            correlation_id=correlation_id, replay_eligible=replay_eligible, safe_details=details or {},
+            correlation_id=correlation_id, replay_eligible=replay_eligible, safe_details=safe_fields(details or {}),
             first_failed_at=datetime.now(timezone.utc).replace(tzinfo=None),
             last_failed_at=datetime.now(timezone.utc).replace(tzinfo=None),
         )
@@ -107,7 +135,14 @@ def create_dead_letter(*, scene_id: str | None, provider_job_id: str | None, tas
 
 
 def replay_dead_letter(dead_letter_id: str, *, publish: Any | None = None) -> bool:
-    publish = publish or (lambda record: celery_app.send_task(record.task_type, args=[record.scene_id], task_id=f"replay:{record.id}"))
+    publish = publish or (
+        lambda record: celery_app.send_task(
+            record.safe_details.get("task_name") or record.task_type,
+            args=record.safe_details.get("task_args") or [record.scene_id],
+            task_id=f"replay:{record.id}",
+            headers={"correlation_id": record.correlation_id},
+        )
+    )
     db = SessionLocal()
     try:
         record = db.get(DeadLetterRecord, dead_letter_id)

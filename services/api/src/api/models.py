@@ -230,6 +230,12 @@ class ProviderJobAttemptRecord(Base):
     attempt_number: Mapped[int] = mapped_column(Integer, nullable=False)
     status: Mapped[ProviderJobAttemptRecordStatus] = mapped_column(Enum(ProviderJobAttemptRecordStatus), nullable=False)
     provider_job_identifier: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    provider_name: Mapped[str] = mapped_column(String(128), nullable=False, default="unknown")
+    failure_classification: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    fallback_reason: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    previous_attempt_id: Mapped[int | None] = mapped_column(
+        ForeignKey("provider_job_attempts.id", ondelete="SET NULL"), nullable=True, index=True
+    )
     failure: Mapped[dict | None] = mapped_column(JSON, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=utc_now, nullable=False)
     completed_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)

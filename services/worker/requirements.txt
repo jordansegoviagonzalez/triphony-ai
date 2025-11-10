@@ -1,5 +1,7 @@
 celery==5.4.0
-redis==5.2.0
+kombu[redis]==5.7.0
+redis==6.4.0
+packaging==26.3
 SQLAlchemy==2.0.36
 psycopg2-binary==2.9.10
 pydantic-settings==2.6.1
