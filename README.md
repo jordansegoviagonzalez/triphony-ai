@@ -1,4 +1,5 @@
 # Triphony AI Art Studio 🎬
+![Triphony Demo](docs/triphony-demo.gif)
 
 **An Event-Driven Generative AI Platform** designed to orchestrate multi-modal asset generation (Video, Audio, Narrative) from a single conceptual prompt.
 
