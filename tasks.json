@@ -1,0 +1,41 @@
+{
+  "version": "2.0.0",
+  "tasks": [
+    {
+      "label": "API (uvicorn)",
+      "type": "shell",
+      "command": "python",
+      "args": ["-m", "uvicorn", "api.main:app", "--reload", "--port", "8000"],
+      "options": {
+        "cwd": "${workspaceFolder}",
+        "env": {
+          "PYTHONPATH": "${workspaceFolder}/services/api/src:${workspaceFolder}/services/worker/src"
+        }
+      },
+      "problemMatcher": []
+    },
+    {
+      "label": "Worker (celery)",
+      "type": "shell",
+      "command": "celery",
+      "args": ["-A", "worker.celery_app", "worker", "--loglevel=INFO"],
+      "options": {
+        "cwd": "${workspaceFolder}",
+        "env": {
+          "PYTHONPATH": "${workspaceFolder}/services/api/src:${workspaceFolder}/services/worker/src"
+        }
+      },
+      "problemMatcher": []
+    },
+    {
+      "label": "UI (next dev)",
+      "type": "shell",
+      "command": "npm",
+      "args": ["run", "dev"],
+      "options": {
+        "cwd": "${workspaceFolder}/apps/web"
+      },
+      "problemMatcher": []
+    }
+  ]
+}
