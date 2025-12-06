@@ -1,14 +1,67 @@
-# Python
+# --- OS cruft ---
+.DS_Store
+Thumbs.db
+
+# --- IDE/project files ---
+.idea/
+.vscode/*
+!.vscode/launch.json
+!.vscode/tasks.json
+
+# --- Secrets / credentials / certs ---
+*.env
+*.env.*
+!.env.example
+.env
+.env.local
+.envrc
+*.pem
+*.key
+*.crt
+*.pfx
+*.keystore
+id_rsa*
+id_ed25519*
+*.auth.json
+*.serviceAccount.json
+
+# --- Python (FastAPI / Worker) ---
 __pycache__/
 *.py[cod]
+*.pyo
 .venv/
-.env
+.eggs/
+*.egg-info/
+.mypy_cache/
+.pytype/
+.pytest_cache/
+.coverage
+coverage.xml
+*.log
 
-# Node
-node_modules/
-.next/
-out/
-.DS_Store
+# --- Node / Next.js (apps/web) ---
+apps/web/node_modules/
+apps/web/.next/
+apps/web/.turbo/
+apps/web/out/
+apps/web/.env*
+apps/web/npm-debug.log*
+apps/web/yarn-error.log*
+apps/web/pnpm-debug.log*
 
-# Artifacts
+# --- Service env files (backend) ---
+services/api/.env
+services/worker/.env
+
+# --- Local data / artifacts (keep docs/, ignore temp outputs) ---
 artifacts/
+data/
+tmp/
+cache/
+
+# --- Docker/local volumes (if any) ---
+docker-data/
+volumes/
+
+# --- Mac metadata in any folder ---
+**/.DS_Store
