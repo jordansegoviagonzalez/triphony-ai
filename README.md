@@ -13,6 +13,54 @@ This project demonstrates a production-grade architecture for handling long-runn
 *   **Provider-Agnostic Design:** The worker layer is designed with an adapter pattern, allowing easy swapping between mock generators (for zero-cost development) and real production APIs (Hugging Face, OpenAI, Stability AI) via configuration.
 *   **Immutable Asset Versioning:** Generative iterations are version-controlled, preserving history and preventing data loss during creative exploration.
 
+## Architecture
+
+```mermaid
+graph TD
+    subgraph "Client Side"
+        Browser[User / Browser]
+    end
+
+    subgraph "Control Plane (FastAPI)"
+        API[API Service]
+        DB[(PostgreSQL)]
+    end
+
+    subgraph "Message Bus"
+        Redis[(Redis Queue)]
+    end
+
+    subgraph "Compute Plane (Worker)"
+        Worker[Celery Worker]
+        Lib[src/triphony_lib]
+    end
+
+    subgraph "Storage"
+        FS[Artifact Storage]
+    end
+
+    %% Flows
+    Browser -- "1. Create Scene (POST)" --> API
+    API -- "2. Persist State" --> DB
+    API -- "3. Enqueue Job" --> Redis
+    
+    Redis -- "4. Consume Task" --> Worker
+    Worker -- "5. Run Pipeline" --> Lib
+    Lib -- "6. Generate" --> FS
+    
+    Worker -- "7. Update Status" --> DB
+    
+    API -- "8. Stream Updates (SSE)" --> Browser
+    Browser -- "9. Fetch Artifacts" --> API
+    API -- "10. Read File" --> FS
+
+    classDef plane fill:#e1f5fe,stroke:#01579b,stroke-width:2px;
+    classDef storage fill:#fff3e0,stroke:#ff6f00,stroke-width:2px;
+    
+    class API,Worker,Lib plane;
+    class DB,Redis,FS storage;
+```
+
 ## System Components
 
 ```text
