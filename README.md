@@ -104,13 +104,13 @@ pip install -r services/api/requirements.txt services/worker/requirements.txt
 
 **Terminal 1: API Service**
 ```bash
-export PYTHONPATH="$(pwd)/services/api/src:$(pwd)/services/worker/src"
+export PYTHONPATH="$(pwd)/services/api/src:$(pwd)/services/worker/src:$(pwd)/src"
 uvicorn api.main:app --reload --port 8000
 ```
 
 **Terminal 2: Worker Node**
 ```bash
-export PYTHONPATH="$(pwd)/services/api/src:$(pwd)/services/worker/src"
+export PYTHONPATH="$(pwd)/services/api/src:$(pwd)/services/worker/src:$(pwd)/src"
 celery -A worker.tasks worker --loglevel=INFO
 ```
 
