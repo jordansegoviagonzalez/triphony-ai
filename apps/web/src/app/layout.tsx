@@ -1,14 +1,41 @@
+"use client";
+
 import "./globals.css";
 import Link from "next/link";
-
-export const metadata = {
-  title: "AI Art Studio",
-  description: "Cinematic scene workflow studio"
-};
+import { useEffect, useState } from "react";
+import { isAuthenticated } from "@/lib/auth";
 
 export default function RootLayout({ children }: { children: React.ReactNode }) {
+  const [loggedIn, setLoggedIn] = useState(false);
+
+  // Check auth state on mount and listen for changes
+  useEffect(() => {
+    setLoggedIn(isAuthenticated());
+
+    const handleAuthChange = () => setLoggedIn(isAuthenticated());
+    window.addEventListener("auth-change", handleAuthChange);
+
+    return () => window.removeEventListener("auth-change", handleAuthChange);
+  }, []);
+
   return (
     <html lang="en">
+      <head>
+        <title>AI Art Studio</title>
+        <script
+          dangerouslySetInnerHTML={{
+            __html: `
+              try {
+                if (localStorage.getItem('triphony_theme') === 'light') {
+                  document.documentElement.setAttribute('data-theme', 'light');
+                } else {
+                  document.documentElement.setAttribute('data-theme', 'dark');
+                }
+              } catch (_) {}
+            `,
+          }}
+        />
+      </head>
       <body>
         <header className="topbar">
           <div className="topbarInner">
@@ -21,6 +48,11 @@ export default function RootLayout({ children }: { children: React.ReactNode }) 
               <Link href="/">Home</Link>
               <Link href="/studio">Studio</Link>
               <Link href="/library">Library</Link>
+              {loggedIn ? (
+                <Link href="/account" className="btn btnPrimary" style={{ padding: "6px 14px", borderRadius: "10px" }}>Account</Link>
+              ) : (
+                <Link href="/login" className="btn" style={{ padding: "6px 14px", borderRadius: "10px" }}>Log In</Link>
+              )}
             </nav>
           </div>
         </header>
@@ -30,3 +62,4 @@ export default function RootLayout({ children }: { children: React.ReactNode }) 
     </html>
   );
 }
+
