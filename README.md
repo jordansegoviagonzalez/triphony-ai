@@ -19,6 +19,7 @@ This project demonstrates a production-grade architecture for handling long-runn
 graph TD
     subgraph "Client Side"
         Browser[User / Browser]
+        NextJS[Next.js UI / Auth]
     end
 
     subgraph "Control Plane (FastAPI)"
@@ -40,19 +41,20 @@ graph TD
     end
 
     %% Flows
-    Browser -- "1. Create Scene (POST)" --> API
-    API -- "2. Persist State" --> DB
-    API -- "3. Enqueue Job" --> Redis
+    Browser -- "1. Login / Manage Account" --> NextJS
+    NextJS -- "2. Create Scene (JWT)" --> API
+    API -- "3. Persist State + User Context" --> DB
+    API -- "4. Enqueue Job" --> Redis
     
-    Redis -- "4. Consume Task" --> Worker
-    Worker -- "5. Run Pipeline" --> Lib
-    Lib -- "6. Generate" --> FS
+    Redis -- "5. Consume Task" --> Worker
+    Worker -- "6. Run Pipeline" --> Lib
+    Lib -- "7. Generate" --> FS
     
-    Worker -- "7. Update Status" --> DB
+    Worker -- "8. Update Status" --> DB
     
-    API -- "8. Stream Updates (SSE)" --> Browser
-    Browser -- "9. Fetch Artifacts" --> API
-    API -- "10. Read File" --> FS
+    API -- "9. Stream Updates (SSE)" --> NextJS
+    NextJS -- "10. Fetch Artifacts" --> API
+    API -- "11. Read File" --> FS
 
     classDef plane fill:#e1f5fe,stroke:#01579b,stroke-width:2px;
     classDef storage fill:#fff3e0,stroke:#ff6f00,stroke-width:2px;

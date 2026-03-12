@@ -7,3 +7,5 @@ pydantic-settings==2.6.1
 python-multipart==0.0.17
 celery==5.4.0
 alembic==1.17.2
+passlib[bcrypt]==1.7.4
+PyJWT==2.10.1

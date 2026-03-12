@@ -5,13 +5,15 @@ import os
 import pathlib
 from typing import AsyncGenerator
 
-from fastapi import APIRouter, Depends, HTTPException, Response
+from fastapi import APIRouter, Depends, HTTPException, Response, status
 from fastapi.responses import FileResponse, StreamingResponse
+from fastapi.security import OAuth2PasswordRequestForm
 from sqlalchemy.orm import Session
 
 from api.db import get_db, engine, Base
-from api.models import Scene, Asset, AssetType, AssetStatus, SceneStatus
-from api.schemas import SceneCreateRequest, SceneCreateResponse, SceneOut, AssetOut, RegenerateRequest
+from api.models import Scene, Asset, AssetType, AssetStatus, SceneStatus, User
+from api.schemas import SceneCreateRequest, SceneCreateResponse, SceneOut, AssetOut, RegenerateRequest, UserCreate, UserOut, Token
+from api.auth import get_current_user, get_password_hash, verify_password, create_access_token
 from api.settings import settings
 
 # Create tables automatically for dev/demo.
@@ -19,6 +21,37 @@ Base.metadata.create_all(bind=engine)
 
 router = APIRouter(prefix="/api/v1")
 
+# --- Authentication Routes ---
+
+@router.post("/auth/register", response_model=Token)
+def register_user(user_in: UserCreate, db: Session = Depends(get_db)):
+    db_user = db.query(User).filter(User.email == user_in.email).first()
+    if db_user:
+        raise HTTPException(status_code=400, detail="Email already registered")
+    
+    hashed_password = get_password_hash(user_in.password)
+    new_user = User(email=user_in.email, name=user_in.name, hashed_password=hashed_password)
+    db.add(new_user)
+    db.commit()
+    db.refresh(new_user)
+    
+    access_token = create_access_token(data={"sub": new_user.id})
+    return {"access_token": access_token, "token_type": "bearer", "user": new_user}
+
+
+@router.post("/auth/login", response_model=Token)
+def login_for_access_token(form_data: OAuth2PasswordRequestForm = Depends(), db: Session = Depends(get_db)):
+    user = db.query(User).filter(User.email == form_data.username).first()
+    if not user or not verify_password(form_data.password, user.hashed_password):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Incorrect email or password",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    access_token = create_access_token(data={"sub": user.id})
+    return {"access_token": access_token, "token_type": "bearer", "user": user}
+
+# --- Scene Routes ---
 
 def _scene_to_out(scene: Scene) -> SceneOut:
     return SceneOut(
@@ -42,13 +75,18 @@ def _scene_to_out(scene: Scene) -> SceneOut:
 
 
 @router.post("/scenes", response_model=SceneCreateResponse)
-def create_scene(payload: SceneCreateRequest, db: Session = Depends(get_db)) -> SceneCreateResponse:
+def create_scene(
+    payload: SceneCreateRequest, 
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+) -> SceneCreateResponse:
     from shared.celery_app import celery_app
 
     import uuid
 
     scene_id = str(uuid.uuid4())
-    scene = Scene(id=scene_id, prompt=payload.prompt, status=SceneStatus.queued)
+    # Link the scene to the authenticated user
+    scene = Scene(id=scene_id, prompt=payload.prompt, status=SceneStatus.queued, user_id=current_user.id)
 
     # Assets created upfront so UI can show placeholders instantly.
     scene.assets = [
