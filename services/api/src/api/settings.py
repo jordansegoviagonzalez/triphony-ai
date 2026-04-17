@@ -10,6 +10,7 @@ class Settings(BaseSettings):
     artifacts_dir: str
     provider_mode: str = "mock"  # "mock" for local dev/testing, "real" for production API integration
     video_generation_api_key: str | None = None
+    cors_origins: str = "http://localhost:3000,http://127.0.0.1:3000"
 
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
 

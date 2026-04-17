@@ -1,4 +1,5 @@
 import os
+import warnings
 from datetime import datetime, timedelta
 from typing import Optional
 
@@ -11,9 +12,15 @@ from sqlalchemy.orm import Session
 
 from api.db import get_db
 from api.models import User
+from api.settings import settings
 
 # Configuration
 SECRET_KEY = os.getenv("SECRET_KEY", "your-super-secret-development-key-change-in-prod")
+if SECRET_KEY == "your-super-secret-development-key-change-in-prod":
+    if settings.provider_mode == "real":
+        raise ValueError("CRITICAL SECURITY ERROR: Using default SECRET_KEY in production mode!")
+    warnings.warn("SECURITY WARNING: Using default SECRET_KEY. This is insecure for production.", RuntimeWarning)
+
 ALGORITHM = "HS256"
 ACCESS_TOKEN_EXPIRE_MINUTES = 60 * 24 * 7  # 7 days
 

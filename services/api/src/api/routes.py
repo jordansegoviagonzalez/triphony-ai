@@ -107,24 +107,24 @@ def create_scene(
 
 
 @router.get("/scenes/{scene_id}", response_model=SceneOut)
-def get_scene(scene_id: str, db: Session = Depends(get_db)) -> SceneOut:
-    scene = db.query(Scene).filter(Scene.id == scene_id).first()
+def get_scene(scene_id: str, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)) -> SceneOut:
+    scene = db.query(Scene).filter(Scene.id == scene_id, Scene.user_id == current_user.id).first()
     if not scene:
         raise HTTPException(status_code=404, detail="Scene not found")
     return _scene_to_out(scene)
 
 
 @router.get("/scenes", response_model=list[SceneOut])
-def list_scenes(db: Session = Depends(get_db)) -> list[SceneOut]:
-    scenes = db.query(Scene).order_by(Scene.created_at.desc()).limit(50).all()
+def list_scenes(db: Session = Depends(get_db), current_user: User = Depends(get_current_user)) -> list[SceneOut]:
+    scenes = db.query(Scene).filter(Scene.user_id == current_user.id).order_by(Scene.created_at.desc()).limit(50).all()
     return [_scene_to_out(s) for s in scenes]
 
 
 @router.post("/scenes/{scene_id}/regenerate")
-def regenerate(scene_id: str, payload: RegenerateRequest, db: Session = Depends(get_db)) -> dict:
+def regenerate(scene_id: str, payload: RegenerateRequest, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)) -> dict:
     from worker.celery_app import celery_app
 
-    scene = db.query(Scene).filter(Scene.id == scene_id).first()
+    scene = db.query(Scene).filter(Scene.id == scene_id, Scene.user_id == current_user.id).first()
     if not scene:
         raise HTTPException(status_code=404, detail="Scene not found")
 
@@ -143,13 +143,13 @@ def regenerate(scene_id: str, payload: RegenerateRequest, db: Session = Depends(
 
 
 @router.get("/scenes/{scene_id}/events")
-async def scene_events(scene_id: str, db: Session = Depends(get_db)) -> StreamingResponse:
+async def scene_events(scene_id: str, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)) -> StreamingResponse:
     # Simple SSE: poll DB and emit state changes. Cheap + reliable for a portfolio demo.
     async def gen() -> AsyncGenerator[bytes, None]:
         last = None
         while True:
             db.expire_all()
-            scene = db.query(Scene).filter(Scene.id == scene_id).first()
+            scene = db.query(Scene).filter(Scene.id == scene_id, Scene.user_id == current_user.id).first()
             if not scene:
                 yield b'event: error\ndata: {"message":"Scene not found"}\n\n'
                 return
@@ -174,7 +174,9 @@ def get_artifact(path: str) -> Response:
     # Prevent path traversal. Only allow artifacts_dir subtree.
     base = pathlib.Path(settings.artifacts_dir).resolve()
     target = (base / path).resolve()
-    if not str(target).startswith(str(base)):
+    
+    # Use is_relative_to for secure path traversal prevention
+    if not target.is_relative_to(base):
         raise HTTPException(status_code=400, detail="Invalid path")
 
     if not target.exists():
