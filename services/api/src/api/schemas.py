@@ -1,13 +1,17 @@
 from __future__ import annotations
 
 from datetime import datetime
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 from typing import Literal
 
 
 AssetType = Literal["narrative", "visual", "soundtrack"]
 AssetStatus = Literal["pending", "running", "succeeded", "failed"]
 SceneStatus = Literal["queued", "running", "done", "failed"]
+WorkflowState = Literal[
+    "queued", "planning", "generating", "technical_qa", "agent_qa", "regenerating",
+    "assembling", "final_qa", "completed", "failed", "cancelled"
+]
 
 
 class SceneCreateRequest(BaseModel):
@@ -24,8 +28,18 @@ class AssetOut(BaseModel):
     version: int
     status: AssetStatus
     content_text: str | None = None
-    artifact_path: str | None = None
+    artifact_url: str | None = None
+    mime_type: str | None = None
     error: str | None = None
+
+
+class FinalRenderOut(BaseModel):
+    id: str
+    version: int
+    status: Literal["pending", "succeeded", "failed"]
+    artifact_url: str | None = None
+    mime_type: str
+    duration_ms: int | None = None
 
 
 class SceneOut(BaseModel):
@@ -33,7 +47,9 @@ class SceneOut(BaseModel):
     prompt: str
     status: SceneStatus
     created_at: datetime
+    workflow_state: WorkflowState
     assets: list[AssetOut]
+    final_render: FinalRenderOut | None = None
 
 
 class SceneCreateResponse(BaseModel):
@@ -52,11 +68,8 @@ class UserOut(BaseModel):
     name: str
     created_at: datetime
 
-    class Config:
-        from_attributes = True
+    model_config = ConfigDict(from_attributes=True)
 
 
-class Token(BaseModel):
-    access_token: str
-    token_type: str
+class SessionResponse(BaseModel):
     user: UserOut

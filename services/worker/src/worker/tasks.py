@@ -13,6 +13,10 @@ from shared.celery_app import celery_app
 from triphony_lib.contracts import GenerationRequest, GenerationResult
 from triphony_lib.pipeline import Pipeline
 
+# Import Phase 4 task definitions so Celery registers the orchestration graph.
+from workflow import orchestrator as _phase4_orchestrator  # noqa: F401
+from workflow.outbox import dispatch_outbox as dispatch_outbox_impl, reconcile_workflows as reconcile_workflows_impl
+
 # Worker connects directly to DB (same URL as API).
 engine = create_engine(settings.database_url, pool_pre_ping=True)
 SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False)
@@ -28,8 +32,7 @@ def _artifact_rel(path: pathlib.Path) -> str:
     try:
         return str(path.resolve().relative_to(base))
     except ValueError:
-        # Fallback if path is not relative to base (e.g. temp dir)
-        return str(path)
+        raise RuntimeError("Generated artifact escaped the configured storage directory")
 
 
 def _update_scene_status(db, scene: Scene) -> None:
@@ -38,6 +41,8 @@ def _update_scene_status(db, scene: Scene) -> None:
         scene.status = SceneStatus.failed
     elif all(s == AssetStatus.succeeded for s in statuses):
         scene.status = SceneStatus.done
+    elif statuses and all(s == AssetStatus.pending for s in statuses):
+        scene.status = SceneStatus.queued
     else:
         scene.status = SceneStatus.running
 
@@ -45,13 +50,13 @@ def _update_scene_status(db, scene: Scene) -> None:
 def _artifact_path_for(scene_id: str, asset_type: str, version: int) -> pathlib.Path:
     # We construct the *directory* where we want the output.
     # The pipeline decides the filename/extension.
-    base = pathlib.Path(settings.artifacts_dir) / scene_id / asset_type
+    base = pathlib.Path(settings.artifacts_dir) / scene_id / asset_type / f"v{version}"
     _ensure_dir(base)
     return base
 
 
 @celery_app.task(name="worker.tasks.generate_asset")
-def generate_asset(scene_id: str, asset_type: str) -> None:
+def generate_asset(scene_id: str, asset_type: str, version: int | None = None) -> None:
     db = SessionLocal()
     try:
         scene = db.query(Scene).filter(Scene.id == scene_id).first()
@@ -60,6 +65,8 @@ def generate_asset(scene_id: str, asset_type: str) -> None:
 
         asset = next((a for a in scene.assets if a.asset_type.value == asset_type), None)
         if not asset:
+            return
+        if version is not None and asset.version != version:
             return
 
         # 1. Update Status to Running
@@ -76,7 +83,6 @@ def generate_asset(scene_id: str, asset_type: str) -> None:
             prompt=scene.prompt,
             asset_type=asset_type,
             provider_mode=settings.provider_mode,
-            api_key=settings.video_generation_api_key if asset_type == "visual" else None,
             output_dir=str(output_dir)
         )
 
@@ -89,11 +95,14 @@ def generate_asset(scene_id: str, asset_type: str) -> None:
             asset.status = AssetStatus.succeeded
             if result.content_text:
                 asset.content_text = result.content_text
+            asset.mime_type = result.mime_type
             
             if result.artifact_path:
                 # The pipeline returns the filename relative to output_dir, 
                 # or the full path. We want to store the project-relative path.
                 full_path = output_dir / result.artifact_path
+                if not full_path.is_file() or full_path.stat().st_size == 0:
+                    raise RuntimeError("Generated artifact is missing or empty")
                 asset.artifact_path = _artifact_rel(full_path)
         else:
             asset.status = AssetStatus.failed
@@ -102,18 +111,28 @@ def generate_asset(scene_id: str, asset_type: str) -> None:
         _update_scene_status(db, scene)
         db.commit()
 
-    except Exception as e:
+    except Exception:
         try:
-            # best-effort update
+            db.rollback()
             scene = db.query(Scene).filter(Scene.id == scene_id).first()
             if scene:
                 asset = next((a for a in scene.assets if a.asset_type.value == asset_type), None)
                 if asset:
                     asset.status = AssetStatus.failed
-                    asset.error = f"System Error: {str(e)}"
+                    asset.error = "Generation failed unexpectedly."
                 _update_scene_status(db, scene)
                 db.commit()
         finally:
             pass
     finally:
         db.close()
+
+
+@celery_app.task(name="worker.tasks.dispatch_outbox")
+def dispatch_outbox() -> dict[str, int]:
+    return dispatch_outbox_impl()
+
+
+@celery_app.task(name="worker.tasks.reconcile_workflows")
+def reconcile_workflows() -> dict[str, int]:
+    return reconcile_workflows_impl()

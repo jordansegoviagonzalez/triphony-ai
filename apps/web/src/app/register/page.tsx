@@ -37,8 +37,9 @@ export default function RegisterPage() {
 
         <form onSubmit={handleSubmit} className="authForm">
           <div className="formGroup">
-            <label>Full Name</label>
+            <label htmlFor="register-name">Full Name</label>
             <input 
+              id="register-name"
               type="text" 
               className="promptInput" 
               value={name}
@@ -49,8 +50,9 @@ export default function RegisterPage() {
           </div>
 
           <div className="formGroup">
-            <label>Email Address</label>
+            <label htmlFor="register-email">Email Address</label>
             <input 
+              id="register-email"
               type="email" 
               className="promptInput" 
               value={email}
@@ -61,15 +63,16 @@ export default function RegisterPage() {
           </div>
 
           <div className="formGroup">
-            <label>Password</label>
+            <label htmlFor="register-password">Password</label>
             <input 
+              id="register-password"
               type="password" 
               className="promptInput" 
               value={password}
               onChange={(e) => setPassword(e.target.value)}
               placeholder="••••••••"
               required 
-              minLength={6}
+              minLength={8}
             />
           </div>
 

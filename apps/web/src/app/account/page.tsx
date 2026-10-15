@@ -12,23 +12,22 @@ export default function AccountPage() {
 
   useEffect(() => {
     // 1. Check Auth Status (Route Protection)
-    const currentUser = getCurrentUser();
-    if (!currentUser) {
-      router.push("/login"); // Not logged in, redirect
-    } else {
+    void getCurrentUser().then((currentUser) => {
+      if (!currentUser) {
+        router.push("/login");
+        return;
+      }
+
       setUser(currentUser);
-      
-      // 2. Load Theme Preference
       const savedTheme = localStorage.getItem("triphony_theme") || "dark";
       setTheme(savedTheme);
       document.documentElement.setAttribute('data-theme', savedTheme);
-      
       setLoading(false);
-    }
+    });
   }, [router]);
 
-  function handleLogout() {
-    logout();
+  async function handleLogout() {
+    await logout();
     router.push("/");
   }
 

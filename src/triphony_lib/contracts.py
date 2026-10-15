@@ -14,7 +14,7 @@ class GenerationRequest:
     asset_type: AssetType
     # Configuration for the specific run (e.g., model version, seed)
     # ensuring reproducibility.
-    provider_mode: str = "mock"  # "mock" or "real"
+    provider_mode: str = "fake"  # "fake" ("mock" remains a compatibility alias) or "real"
     api_key: Optional[str] = None
     output_dir: str = "/tmp/artifacts"
 
@@ -25,6 +25,7 @@ class GenerationResult:
     # If successful:
     content_text: Optional[str] = None
     artifact_path: Optional[str] = None # Relative path
+    mime_type: Optional[str] = None
     # If failed:
     error_message: Optional[str] = None
     # Meta info for calibration/logging

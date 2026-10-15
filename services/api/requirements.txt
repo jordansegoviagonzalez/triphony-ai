@@ -2,11 +2,14 @@ fastapi==0.115.6
 uvicorn[standard]==0.32.1
 SQLAlchemy==2.0.36
 psycopg2-binary==2.9.10
-pydantic==2.10.2
+pydantic==2.12.5
 pydantic-settings==2.6.1
 python-multipart==0.0.17
 celery==5.4.0
+redis==5.2.0
 alembic==1.17.2
 passlib==1.7.4
 bcrypt==3.2.2
 PyJWT==2.10.1
+boto3>=1.35,<2
+opentelemetry-api>=1.27,<2

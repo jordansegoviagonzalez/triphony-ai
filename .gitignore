@@ -48,6 +48,7 @@ apps/web/.env*
 apps/web/npm-debug.log*
 apps/web/yarn-error.log*
 apps/web/pnpm-debug.log*
+*.tsbuildinfo
 
 # --- Service env files (backend) ---
 services/api/.env

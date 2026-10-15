@@ -36,8 +36,9 @@ export default function LoginPage() {
 
         <form onSubmit={handleSubmit} className="authForm">
           <div className="formGroup">
-            <label>Email Address</label>
+            <label htmlFor="login-email">Email Address</label>
             <input 
+              id="login-email"
               type="email" 
               className="promptInput" 
               value={email}
@@ -48,8 +49,9 @@ export default function LoginPage() {
           </div>
 
           <div className="formGroup">
-            <label>Password</label>
+            <label htmlFor="login-password">Password</label>
             <input 
+              id="login-password"
               type="password" 
               className="promptInput" 
               value={password}

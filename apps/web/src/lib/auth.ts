@@ -1,89 +1,61 @@
-// Mock Authentication Service
-// Replace these functions with real API calls to your FastAPI backend later.
+import { request } from "@/lib/api";
 
 export interface User {
   id: string;
   email: string;
   name: string;
+  created_at?: string;
 }
 
-const AUTH_KEY = "triphony_auth_token";
-const USER_KEY = "triphony_user";
+type AuthResponse = { user: User };
 
-export async function login(email: string, password: string): Promise<{ token: string; user: User }> {
-  // Simulate network delay
-  await new Promise((resolve) => setTimeout(resolve, 500));
-
-  // Basic validation
+export async function login(email: string, password: string): Promise<AuthResponse> {
   if (!email || !password) {
     throw new Error("Email and password are required.");
   }
 
-  // MOCK LOGIN: Accept any email/password for the prototype
-  const user: User = {
-    id: "user_" + Math.random().toString(36).substring(2, 9),
-    email,
-    name: email.split("@")[0], // Simple mock name based on email
-  };
-  const token = "mock_jwt_token_" + Date.now();
-
-  if (typeof window !== "undefined") {
-    localStorage.setItem(AUTH_KEY, token);
-    localStorage.setItem(USER_KEY, JSON.stringify(user));
-    // Dispatch an event so other components (like layout) know auth state changed
-    window.dispatchEvent(new Event("auth-change"));
-  }
-
-  return { token, user };
+  const body = new URLSearchParams({ username: email, password });
+  const result = await request<AuthResponse>("/auth/login", {
+    method: "POST",
+    headers: { "Content-Type": "application/x-www-form-urlencoded" },
+    body: body.toString()
+  });
+  notifyAuthChange();
+  return result;
 }
 
-export async function register(email: string, password: string, name: string): Promise<{ token: string; user: User }> {
-  // Simulate network delay
-  await new Promise((resolve) => setTimeout(resolve, 500));
-
+export async function register(email: string, password: string, name: string): Promise<AuthResponse> {
   if (!email || !password || !name) {
     throw new Error("All fields are required.");
   }
 
-  // MOCK REGISTER: Auto-login after registration
-  const user: User = {
-    id: "user_" + Math.random().toString(36).substring(2, 9),
-    email,
-    name,
-  };
-  const token = "mock_jwt_token_" + Date.now();
-
-  if (typeof window !== "undefined") {
-    localStorage.setItem(AUTH_KEY, token);
-    localStorage.setItem(USER_KEY, JSON.stringify(user));
-    window.dispatchEvent(new Event("auth-change"));
-  }
-
-  return { token, user };
+  const result = await request<AuthResponse>("/auth/register", {
+    method: "POST",
+    body: JSON.stringify({ email, password, name })
+  });
+  notifyAuthChange();
+  return result;
 }
 
-export function logout() {
-  if (typeof window !== "undefined") {
-    localStorage.removeItem(AUTH_KEY);
-    localStorage.removeItem(USER_KEY);
-    window.dispatchEvent(new Event("auth-change"));
-  }
+export async function logout(): Promise<void> {
+  await request<{ ok: boolean }>("/auth/logout", { method: "POST" });
+  notifyAuthChange();
 }
 
-export function getCurrentUser(): User | null {
-  if (typeof window === "undefined") return null; // Handle SSR
-  
-  const userJson = localStorage.getItem(USER_KEY);
-  if (!userJson) return null;
-
+export async function getCurrentUser(): Promise<User | null> {
   try {
-    return JSON.parse(userJson) as User;
-  } catch (e) {
+    return await request<User>("/auth/me");
+  } catch {
     return null;
   }
 }
 
-export function isAuthenticated(): boolean {
-  if (typeof window === "undefined") return false;
-  return !!localStorage.getItem(AUTH_KEY);
+export async function isAuthenticated(): Promise<boolean> {
+  return (await getCurrentUser()) !== null;
+}
+
+function notifyAuthChange() {
+  if (typeof window !== "undefined") {
+    window.dispatchEvent(new Event("auth-change"));
+  }
 }

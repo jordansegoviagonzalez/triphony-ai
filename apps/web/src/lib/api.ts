@@ -1,26 +1,38 @@
 import type { Scene, AssetKind } from "@/lib/types";
-import { upsertLibraryItem } from "@/lib/libraryStore";
 
-const API_BASE =
+export const API_BASE =
   (process.env.NEXT_PUBLIC_API_BASE_URL || "http://localhost:8000/api/v1").replace(/\/+$/, "");
 
-export function artifactUrl(path: string) {
-  const u = new URL(`${API_BASE}/artifacts`);
-  u.searchParams.set("path", path);
-  return u.toString();
+export function artifactUrl(assetId: number) {
+  return `${API_BASE}/artifacts/${assetId}`;
 }
 
-async function request<T>(path: string, init?: RequestInit): Promise<T> {
+export async function request<T>(path: string, init?: RequestInit): Promise<T> {
+  const method = (init?.method || "GET").toUpperCase();
+  const csrf = typeof document === "undefined"
+    ? undefined
+    : document.cookie.split("; ").find((item) => item.startsWith("triphony_csrf="))?.split("=")[1];
   const res = await fetch(`${API_BASE}${path}`, {
     ...init,
+    credentials: "include",
     headers: {
-      "Content-Type": "application/json",
+      ...(init?.body ? { "Content-Type": "application/json" } : {}),
+      ...(csrf && !["GET", "HEAD", "OPTIONS"].includes(method) ? { "X-CSRF-Token": decodeURIComponent(csrf) } : {}),
       ...(init?.headers || {})
     },
     cache: "no-store"
   });
 
-  if (!res.ok) throw new Error(await res.text());
+  if (!res.ok) {
+    let message = `Request failed (${res.status})`;
+    try {
+      const body = (await res.json()) as { detail?: string };
+      message = body.detail || message;
+    } catch {
+      // Keep the stable status-based message for non-JSON errors.
+    }
+    throw new Error(message);
+  }
   return (await res.json()) as T;
 }
 
@@ -30,7 +42,6 @@ export async function createScene(prompt: string): Promise<{ scene_id: string }>
     body: JSON.stringify({ prompt })
   });
 
-  upsertLibraryItem({ id: out.scene_id, prompt, createdAt: new Date().toISOString() });
   return out;
 }
 

@@ -9,11 +9,122 @@ services:
       - "5433:5432"
     volumes:
       - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d ai_art_studio"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
 
   redis:
     image: redis:7
     ports:
       - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+
+  migrate:
+    build:
+      context: .
+      dockerfile: services/api/Dockerfile
+    environment:
+      DATABASE_URL: postgresql+psycopg2://postgres:postgres@postgres:5432/ai_art_studio
+      REDIS_URL: redis://redis:6379/0
+      ARTIFACTS_DIR: /app/artifacts
+      PROVIDER_MODE: fake
+      SECRET_KEY: triphony-local-development-secret-change-me
+    command: ["alembic", "-c", "/app/services/api/alembic.ini", "upgrade", "head"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  artifact-init:
+    build:
+      context: .
+      dockerfile: services/worker/Dockerfile
+    user: "0:0"
+    command: ["sh", "-c", "chown -R 10001:10001 /app/artifacts"]
+    volumes:
+      - artifacts:/app/artifacts
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+
+  api:
+    build:
+      context: .
+      dockerfile: services/api/Dockerfile
+    environment:
+      DATABASE_URL: postgresql+psycopg2://postgres:postgres@postgres:5432/ai_art_studio
+      REDIS_URL: redis://redis:6379/0
+      ARTIFACTS_DIR: /app/artifacts
+      PROVIDER_MODE: fake
+      SECRET_KEY: triphony-local-development-secret-change-me
+      AUTH_COOKIE_SECURE: "false"
+      CORS_ORIGINS: http://localhost:3000,http://127.0.0.1:3000
+    command: ["uvicorn", "api.main:app", "--host", "0.0.0.0", "--port", "8000"]
+    ports:
+      - "8000:8000"
+    volumes:
+      - artifacts:/app/artifacts
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      artifact-init:
+        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test:
+        ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:8000/api/v1/health')\""]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+
+  worker:
+    build:
+      context: .
+      dockerfile: services/worker/Dockerfile
+    environment:
+      DATABASE_URL: postgresql+psycopg2://postgres:postgres@postgres:5432/ai_art_studio
+      REDIS_URL: redis://redis:6379/0
+      ARTIFACTS_DIR: /app/artifacts
+      PROVIDER_MODE: fake
+      SECRET_KEY: triphony-local-development-secret-change-me
+    command: ["celery", "-A", "shared.celery_app", "worker", "--loglevel=INFO", "--hostname=worker@%h"]
+    volumes:
+      - artifacts:/app/artifacts
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      artifact-init:
+        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
+      api:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "celery -A shared.celery_app inspect ping --timeout=5 | grep -q pong"]
+      interval: 10s
+      timeout: 8s
+      retries: 12
+
+  web:
+    build:
+      context: ./apps/web
+      dockerfile: Dockerfile
+      args:
+        NEXT_PUBLIC_API_BASE_URL: http://localhost:8000/api/v1
+    environment:
+      NEXT_PUBLIC_API_BASE_URL: http://localhost:8000/api/v1
+    ports:
+      - "3000:3000"
+    depends_on:
+      api:
+        condition: service_healthy
 
 volumes:
   pgdata:
+  artifacts:

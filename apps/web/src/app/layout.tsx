@@ -3,16 +3,18 @@
 import "./globals.css";
 import Link from "next/link";
 import { useEffect, useState } from "react";
-import { isAuthenticated } from "@/lib/auth";
+import { getCurrentUser } from "@/lib/auth";
 
 export default function RootLayout({ children }: { children: React.ReactNode }) {
   const [loggedIn, setLoggedIn] = useState(false);
 
   // Check auth state on mount and listen for changes
   useEffect(() => {
-    setLoggedIn(isAuthenticated());
+    void getCurrentUser().then((user) => setLoggedIn(user !== null));
 
-    const handleAuthChange = () => setLoggedIn(isAuthenticated());
+    const handleAuthChange = () => {
+      void getCurrentUser().then((user) => setLoggedIn(user !== null));
+    };
     window.addEventListener("auth-change", handleAuthChange);
 
     return () => window.removeEventListener("auth-change", handleAuthChange);
@@ -62,4 +64,3 @@ export default function RootLayout({ children }: { children: React.ReactNode }) 
     </html>
   );
 }
-

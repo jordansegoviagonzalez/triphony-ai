@@ -18,11 +18,11 @@
       "label": "Worker (celery)",
       "type": "shell",
       "command": "celery",
-      "args": ["-A", "worker.celery_app", "worker", "--loglevel=INFO"],
+      "args": ["-A", "shared.celery_app", "worker", "--loglevel=INFO"],
       "options": {
         "cwd": "${workspaceFolder}",
         "env": {
-          "PYTHONPATH": "${workspaceFolder}/services/api/src:${workspaceFolder}/services/worker/src"
+          "PYTHONPATH": "${workspaceFolder}/services/api/src:${workspaceFolder}/services/worker/src:${workspaceFolder}/src"
         }
       },
       "problemMatcher": []

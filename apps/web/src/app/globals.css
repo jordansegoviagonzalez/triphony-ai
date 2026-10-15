@@ -212,6 +212,13 @@ main.main {
   object-fit: cover;
   border-radius: 12px;
 }
+.visualVideo {
+  width: 100%;
+  height: 240px;
+  object-fit: cover;
+  border-radius: 12px;
+  background: #000;
+}
 
 .narrativeText {
   width: 100%;

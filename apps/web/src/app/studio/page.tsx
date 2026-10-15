@@ -2,8 +2,9 @@
 
 import { useEffect, useMemo, useRef, useState } from "react";
 import type { Scene, Asset } from "@/lib/types";
-import { artifactUrl, createScene, getScene, regenerate, sceneEventsUrl } from "@/lib/api";
+import { createScene, getScene, regenerate, sceneEventsUrl } from "@/lib/api";
 import { EditorModal } from "@/components/EditorModal";
+import { MediaRenderer } from "@/components/MediaRenderer";
 
 function useQueryParam(name: string) {
   const [value, setValue] = useState<string | null>(null);
@@ -24,6 +25,7 @@ export default function StudioPage() {
   const [scene, setScene] = useState<Scene | null>(null);
   const [busy, setBusy] = useState(false);
   const [status, setStatus] = useState<string>("");
+  const [error, setError] = useState("");
 
   const [editNarrativeOpen, setEditNarrativeOpen] = useState(false);
   const [editSoundOpen, setEditSoundOpen] = useState(false);
@@ -39,7 +41,9 @@ export default function StudioPage() {
 
   useEffect(() => {
     if (!existingId) return;
-    load(existingId).catch(() => null);
+    load(existingId).catch((err: unknown) => {
+      setError(err instanceof Error ? err.message : "Unable to load scene.");
+    });
   }, [existingId]);
 
   useEffect(() => () => esRef.current?.close(), []);
@@ -53,15 +57,16 @@ export default function StudioPage() {
     if (p.length < 3) return;
 
     setBusy(true);
+    setError("");
     setStatus("Generating…");
     try {
       const out = await createScene(p);
-      const s = await load(out.scene_id);
+      await load(out.scene_id);
 
       window.history.replaceState({}, "", `/studio?scene=${encodeURIComponent(out.scene_id)}`);
 
       esRef.current?.close();
-      esRef.current = new EventSource(sceneEventsUrl(out.scene_id));
+      esRef.current = new EventSource(sceneEventsUrl(out.scene_id), { withCredentials: true });
       esRef.current.addEventListener("scene.update", (ev) => {
         try {
           const next = JSON.parse((ev as MessageEvent).data) as Scene;
@@ -69,11 +74,19 @@ export default function StudioPage() {
         } catch {}
       });
       esRef.current.addEventListener("scene.completed", async () => {
-        const final = await load(out.scene_id);
-        setStatus(final.status === "done" ? "Done." : "Completed.");
+        try {
+          const final = await load(out.scene_id);
+          setStatus(final.status === "done" ? "Done." : "Completed with failures.");
+        } catch (err: unknown) {
+          setError(err instanceof Error ? err.message : "Unable to load completed scene.");
+        }
         esRef.current?.close();
       });
+      esRef.current.onerror = () => setStatus("Progress connection interrupted; reconnecting…");
 
+    } catch (err: unknown) {
+      setError(err instanceof Error ? err.message : "Unable to generate scene.");
+      setStatus("");
     } finally {
       setBusy(false);
     }
@@ -82,6 +95,7 @@ export default function StudioPage() {
   async function onRegenerateClip() {
     if (!scene) return;
     setBusy(true);
+    setError("");
     setStatus("Regenerating clip…");
     try {
       // This button is the “producer” action: refresh all assets together.
@@ -91,6 +105,8 @@ export default function StudioPage() {
         regenerate(scene.scene_id, "soundtrack")
       ]);
       await load(scene.scene_id);
+    } catch (err: unknown) {
+      setError(err instanceof Error ? err.message : "Unable to regenerate scene.");
     } finally {
       setBusy(false);
     }
@@ -117,11 +133,7 @@ export default function StudioPage() {
           <div className="panel">
             <div className="panelTitle cyan">Soundtrack</div>
             <div className="panelBody">
-              {soundtrack?.artifact_path ? (
-                <audio controls src={artifactUrl(soundtrack.artifact_path)} style={{ width: "100%" }} />
-              ) : (
-                <div className="placeholder">Waiting for audio…</div>
-              )}
+              <MediaRenderer asset={soundtrack} />
             </div>
 
             <button className="btn" disabled={!scene || busy} onClick={() => setEditSoundOpen(true)}>
@@ -133,12 +145,7 @@ export default function StudioPage() {
           <div className="panel">
             <div className="panelTitle pink">Visual</div>
             <div className="panelBody">
-              {visual?.artifact_path ? (
-                // eslint-disable-next-line @next/next/no-img-element
-                <img className="visualImg" src={artifactUrl(visual.artifact_path)} alt="visual concept frame" />
-              ) : (
-                <div className="placeholder">Waiting for visual…</div>
-              )}
+              <MediaRenderer asset={visual} />
             </div>
 
             <button className="btn btnPrimary" disabled={!scene || busy} onClick={onRegenerateClip}>
@@ -150,7 +157,7 @@ export default function StudioPage() {
           <div className="panel">
             <div className="panelTitle cyan">Narrative</div>
             <div className="panelBody" style={{ placeItems: "start" }}>
-              <pre className="narrativeText">{narrative?.content_text ?? "Waiting for narrative…"}</pre>
+              <MediaRenderer asset={narrative} />
             </div>
 
             <button className="btn" disabled={!scene || busy} onClick={() => setEditNarrativeOpen(true)}>
@@ -174,6 +181,7 @@ export default function StudioPage() {
         <div style={{ marginTop: 10, color: "rgba(255,255,255,.62)", fontSize: 12 }}>
           {status ? status : "NOTE: Postgres and Redis are configured with Docker for the full pipeline."}
         </div>
+        {error && <div className="errorBanner" style={{ marginTop: 10 }}>{error}</div>}
       </div>
 
       <EditorModal
